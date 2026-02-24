@@ -9,17 +9,30 @@ alerted = {}
 prev_prices = {}
 
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        print(f"שגיאת טלגרם: {e}")
 
 def get_bybit_tickers():
-    url = "https://api.bybit.com/v5/market/tickers?category=linear"
-    r = requests.get(url)
-    return r.json()["result"]["list"]
+    try:
+        url = "https://api.bybit.com/v5/market/tickers?category=linear"
+        r = requests.get(url, timeout=10)
+        return r.json()["result"]["list"]
+    except Exception as e:
+        print(f"שגיאת Bybit: {e}")
+        return []
 
 def scan():
+    print("סורק...")
     tickers = get_bybit_tickers()
+    if not tickers:
+        print("אין נתונים")
+        return
+
     now = time.time()
+    found = 0
 
     for t in tickers:
         try:
@@ -40,12 +53,10 @@ def scan():
             if volume < 1000000 or volume > 80000000:
                 continue
 
-            # סיגנלי LONG
             long_15m = change_15m >= 3 and change_24h >= 5
             long_24h = change_24h >= 8 and change_24h <= 25
             long_funding = funding >= 0.1 and change_24h >= 5
 
-            # סיגנלי SHORT
             short_15m = change_15m <= -3 and change_24h <= -5
             short_24h = change_24h <= -8 and change_24h >= -25
             short_funding = funding <= -0.1 and change_24h <= -5
@@ -59,40 +70,37 @@ def scan():
             if is_long:
                 if long_15m:
                     emoji = "⚡"
-                    signal_txt = "זז עכשיו — כניסה LONG מוקדמת"
+                    signal_txt = "זז עכשיו — LONG מוקדם"
                 elif long_funding:
                     emoji = "💹"
                     signal_txt = "Funding גבוה — LONG חזק"
                 else:
                     emoji = "🚀"
-                    signal_txt = "כניסה LONG חזקה"
-
+                    signal_txt = "כניסה LONG"
                 if funding >= 0.1:
-                    funding_txt = f"💹 Funding: {funding:.4f}% 🔥 לונגים חזקים"
+                    funding_txt = f"💹 Funding: {funding:.4f}% 🔥"
                 elif funding < 0:
-                    funding_txt = f"💹 Funding: {funding:.4f}% ❄️ שורטים משלמים"
+                    funding_txt = f"💹 Funding: {funding:.4f}% ❄️"
                 else:
                     funding_txt = f"💹 Funding: {funding:.4f}%"
-
+                direction = "🟢 LONG"
             else:
                 if short_15m:
                     emoji = "⚡"
-                    signal_txt = "זז עכשיו — כניסה SHORT מוקדמת"
+                    signal_txt = "זז עכשיו — SHORT מוקדם"
                 elif short_funding:
                     emoji = "🩸"
                     signal_txt = "Funding שלילי — SHORT חזק"
                 else:
                     emoji = "📉"
-                    signal_txt = "כניסה SHORT חזקה"
-
+                    signal_txt = "כניסה SHORT"
                 if funding <= -0.1:
-                    funding_txt = f"💹 Funding: {funding:.4f}% 🩸 שורטים חזקים"
+                    funding_txt = f"💹 Funding: {funding:.4f}% 🩸"
                 elif funding > 0:
-                    funding_txt = f"💹 Funding: {funding:.4f}% 🔥 לונגים משלמים"
+                    funding_txt = f"💹 Funding: {funding:.4f}% 🔥"
                 else:
                     funding_txt = f"💹 Funding: {funding:.4f}%"
-
-            direction = "🟢 LONG" if is_long else "🔴 SHORT"
+                direction = "🔴 SHORT"
 
             msg = (
                 f"{emoji} <b>{symbol}</b> — {direction}\n"
@@ -105,10 +113,19 @@ def scan():
             )
             send_telegram(msg)
             alerted[symbol] = now
+            found += 1
+            print(f"נמצא: {symbol} {direction}")
 
-        except:
-            pass
+        except Exception as e:
+            print(f"שגיאה ב-{t.get('symbol','?')}: {e}")
+            continue
 
+    print(f"סריקה הסתיימה — נמצאו {found} סיגנלים")
+
+print("מתחיל סורק...")
 while True:
-    scan()
+    try:
+        scan()
+    except Exception as e:
+        print(f"שגיאה כללית: {e}")
     time.sleep(900)
