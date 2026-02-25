@@ -1,17 +1,18 @@
 import os
 import time
+import json
 import threading
-from collections import deque
+from collections import deque, defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
+import websocket  # pip install websocket-client
 
 # =========================
 # Railway keep-alive server
 # =========================
 
 PORT = int(os.environ.get("PORT", "8080"))
-
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -20,84 +21,50 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        return
+        return  # silence default logging
 
 
 def run_server():
-    print(f"✅ HTTP server listening on 0.0.0.0:{PORT}", flush=True)
+    print(f"HTTP server on port {PORT}", flush=True)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
 threading.Thread(target=run_server, daemon=True).start()
 
 # =========================
-# Config - OPTIMIZED FOR SPEED
+# Config
 # =========================
-
-SCAN_INTERVAL_SEC = 60            # every 1 minute
-LOOKBACK_5M_SEC = 300            # 5min for scalping
-LOOKBACK_15M_SEC = 900           # 15min for swing
-LOOKBACK_1H_SEC = 3600           # 1H for trend confirmation
-ALERT_COOLDOWN_SEC = 4 * 60 * 60 # 4 hours
-
-# Filters
-MIN_OI = 1_000_000
-MAX_OI = 300_000_000
-
-# Pump/Dump - STRICTER
-EXTREME_MOVE_1H = 15.0
-PUMP_24H_PCT = 25.0
-DUMP_24H_PCT = -25.0
-
-# Volume - MORE AGGRESSIVE
-VOL_DELTA_MIN_USD = 150_000
-VOL_SPIKE_EXTREME = 8.0
-VOL_SPIKE_STRONG = 5.0
-VOL_SPIKE_MED = 3.0
-
-# Movement - SCALPING FOCUSED
-MOVE_EXPLOSIVE = 8.0
-MOVE_STRONG = 4.0
-MOVE_MED = 2.0
-
-# Funding
-FUNDING_HIGH = 0.10
-FUNDING_EXTREME = 0.15
-FUNDING_TREND = 0.05
-
-# Price Acceleration
-ACCELERATION_THRESHOLD = 1.5
-
-# Large Order Detection
-LARGE_ORDER_MIN_USD = 500_000
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+
+# Alert cooldown
+ALERT_COOLDOWN_SEC = 4 * 60 * 60  # 4 hours
+
+# Movement thresholds (real-time)
+MOVE_1MIN_STRONG = 2.5  # 2.5% in 1 minute
+MOVE_3MIN_STRONG = 4.0  # 4% in 3 minutes
+MOVE_5MIN_STRONG = 5.0  # 5% in 5 minutes
+
+# OI filter
+MIN_OI = 1_000_000
+MAX_OI = 300_000_000
 
 # =========================
 # State
 # =========================
 
-symbol_state = {}
+# symbol -> deque of (timestamp, price)
+price_history = defaultdict(lambda: deque(maxlen=600))  # ~10 minutes
+
+# symbol -> last alert timestamp
 alerted = {}
-market_history = deque(maxlen=5)
-last_market_alert_key = ""
 
+# symbol -> metadata dict
+symbol_metadata = {}
 
-def get_state(symbol: str):
-    if symbol not in symbol_state:
-        symbol_state[symbol] = {
-            "prices": deque(maxlen=180),
-            "turnover_delta": deque(maxlen=180),
-            "oi": deque(maxlen=180),
-            "funding": deque(maxlen=180),
-            "prev_turnover24h": None,
-            "price_5m_ago": None,
-            "price_15m_ago": None,
-            "price_1h_ago": None,
-        }
-    return symbol_state[symbol]
-
+# Lock for thread safety
+lock = threading.Lock()
 
 # =========================
 # Utils
@@ -115,521 +82,311 @@ def send_telegram(msg: str):
         if not TELEGRAM_TOKEN or not CHAT_ID:
             print("⚠️ Missing TELEGRAM_TOKEN or CHAT_ID", flush=True)
             return
+
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(
+        r = requests.post(
             url,
             data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
+        if r.status_code != 200:
+            print(f"Telegram API error: {r.status_code} {r.text}", flush=True)
     except Exception as e:
-        print("Telegram error:", str(e), flush=True)
+        print(f"Telegram error: {e}", flush=True)
 
 
-def get_bybit_tickers():
+def calc_change(prices: deque, lookback_sec: int) -> float:
+    """
+    Calculate % change over last N seconds.
+    prices: deque of (timestamp, price)
+    """
+    if len(prices) < 2:
+        return 0.0
+
+    now = time.time()
+    target_time = now - lookback_sec
+
+    old_price = None
+    # find first price with ts >= target_time
+    for ts, p in prices:
+        if ts >= target_time:
+            old_price = p
+            break
+
+    if old_price is None or old_price == 0:
+        return 0.0
+
+    curr_price = prices[-1][1]
+    return ((curr_price - old_price) / old_price) * 100.0
+
+
+# =========================
+# Metadata updater (REST every 30s)
+# =========================
+
+def update_metadata():
+    """
+    Fetch OI, volume, funding from REST API every 30s
+    """
+    while True:
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=linear"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+
+            tickers = data.get("result", {}).get("list", []) or []
+
+            with lock:
+                for t in tickers:
+                    symbol = t.get("symbol") or ""
+                    if not symbol:
+                        continue
+
+                    oi = safe_float(t.get("openInterestValue", 0))
+                    turnover24h = safe_float(t.get("turnover24h", 0))
+                    funding = safe_float(t.get("fundingRate", 0)) * 100.0
+                    volume24h = safe_float(t.get("volume24h", 0))
+
+                    symbol_metadata[symbol] = {
+                        "oi": oi,
+                        "turnover24h": turnover24h,
+                        "funding": funding,
+                        "volume24h": volume24h,
+                        "last_update": time.time()
+                    }
+
+            print(f"✅ Updated metadata for {len(tickers)} symbols", flush=True)
+
+        except Exception as e:
+            print(f"Metadata error: {e}", flush=True)
+
+        time.sleep(30)
+
+
+threading.Thread(target=update_metadata, daemon=True).start()
+
+# =========================
+# Symbol list
+# =========================
+
+def get_top_symbols():
+    """
+    Get top symbols by turnover among those passing OI filter.
+    Returns list like ['BTCUSDT', 'ETHUSDT', ...]
+    """
     try:
         url = "https://api.bybit.com/v5/market/tickers?category=linear"
         r = requests.get(url, timeout=10)
         data = r.json()
-        return data["result"]["list"]
+        tickers = data.get("result", {}).get("list", []) or []
+
+        valid = []
+        for t in tickers:
+            symbol = t.get("symbol") or ""
+            oi = safe_float(t.get("openInterestValue", 0))
+            turnover = safe_float(t.get("turnover24h", 0))
+            if symbol and (MIN_OI <= oi <= MAX_OI):
+                valid.append((symbol, turnover))
+
+        valid.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [s for s, _ in valid[:100]]
+
+        print(f"Tracking {len(top_symbols)} symbols", flush=True)
+        return top_symbols
+
     except Exception as e:
-        print("Bybit error:", str(e), flush=True)
-        return []
-
-
-def get_recent_trades(symbol, limit=100):
-    """
-    Get recent trades to detect large orders
-    """
-    try:
-        url = f"https://api.bybit.com/v5/market/recent-trade?category=linear&symbol={symbol}&limit={limit}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if data.get("retCode") != 0:
-            return []
-        return data["result"]["list"]
-    except Exception:
-        return []
-
-
-def price_change_over_lookback(prices_deque, now_ts, lookback_sec):
-    if len(prices_deque) < 2:
-        return 0.0
-
-    target = now_ts - lookback_sec
-    old_price = None
-
-    for ts, p in prices_deque:
-        if ts >= target:
-            old_price = p
-            break
-
-    if old_price is None:
-        old_price = prices_deque[0][1]
-
-    curr_price = prices_deque[-1][1]
-    if old_price <= 0:
-        return 0.0
-    return ((curr_price - old_price) / old_price) * 100.0
-
-
-def calc_avg(values):
-    if not values:
-        return None
-    return sum(values) / len(values)
-
-
-def calc_oi_trend(oi_deque):
-    if len(oi_deque) < 3:
-        return 0.0
-    items = list(oi_deque)
-    changes = []
-    for i in range(1, len(items)):
-        prev = items[i - 1][1]
-        curr = items[i][1]
-        if prev > 0:
-            changes.append(((curr - prev) / prev) * 100.0)
-    return calc_avg(changes) if changes else 0.0
-
-
-def calc_funding_trend(funding_deque):
-    if len(funding_deque) < 3:
-        return 0.0
-    return funding_deque[-1][1] - funding_deque[0][1]
+        print(f"Error getting symbols: {e}", flush=True)
+        return [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+            "ADAUSDT", "DOGEUSDT", "MATICUSDT", "DOTUSDT", "AVAXUSDT"
+        ]
 
 
 # =========================
-# Advanced Detection
+# Signal checker
 # =========================
 
-def detect_price_acceleration(prices_deque, now_ts):
+def check_signal(symbol: str, price: float):
     """
-    Detect if price is accelerating (moving faster than before)
-    Returns: acceleration_ratio (1.0 = normal, >1.5 = accelerating)
+    Decide whether to send LONG/SHORT alert based on recent movement.
     """
-    if len(prices_deque) < 20:
-        return 1.0
-
-    recent_5m = price_change_over_lookback(prices_deque, now_ts, 300)
-    prev_10m = price_change_over_lookback(prices_deque, now_ts - 300, 600)
-
-    if abs(prev_10m) < 0.5 or prev_10m == 0:
-        return 1.0
-
-    ratio = abs(recent_5m) / abs(prev_10m)
-    return ratio
-
-
-def detect_large_orders(trades, price):
-    """
-    Detect whale orders from recent trades
-    Returns: (total_buy_usd, total_sell_usd, net_bias)
-    """
-    buy_volume = 0.0
-    sell_volume = 0.0
-
-    for trade in trades:
-        try:
-            size = safe_float(trade.get("size", 0))
-            side = trade.get("side", "")
-            trade_price = safe_float(trade.get("price", 0))
-            value_usd = size * trade_price
-
-            if side == "Buy":
-                buy_volume += value_usd
-            else:
-                sell_volume += value_usd
-        except Exception:
-            continue
-
-    net_bias = buy_volume - sell_volume
-    return buy_volume, sell_volume, net_bias
-
-
-def detect_structure_break(prices_deque, now_ts):
-    """
-    Simple structure break detection:
-    Returns: ("bullish_break", "bearish_break", "none")
-    """
-    if len(prices_deque) < 30:
-        return "none"
-
-    recent_prices = []
-    target_ts = now_ts - 3600
-
-    for ts, p in prices_deque:
-        if ts >= target_ts:
-            recent_prices.append(p)
-
-    if len(recent_prices) < 10:
-        return "none"
-
-    curr_price = recent_prices[-1]
-    recent_high = max(recent_prices[:-5])
-    recent_low = min(recent_prices[:-5])
-
-    if curr_price > recent_high * 1.005:
-        return "bullish_break"
-
-    if curr_price < recent_low * 0.995:
-        return "bearish_break"
-
-    return "none"
-
-
-# =========================
-# Market breadth
-# =========================
-
-def analyze_market(tickers):
-    gainers = 0
-    losers = 0
-    for t in tickers:
-        ch = safe_float(t.get("price24hPcnt", 0)) * 100.0
-        if ch > 2:
-            gainers += 1
-        elif ch < -2:
-            losers += 1
-
-    total = gainers + losers
-    if total == 0:
-        return "neutral", 50.0
-
-    bull_pct = (gainers / total) * 100.0
-    if bull_pct >= 70:
-        return "bull", bull_pct
-    if bull_pct <= 30:
-        return "bear", bull_pct
-    return "neutral", bull_pct
-
-
-def detect_market_move(trend, bull_pct):
-    market_history.append({"trend": trend, "bull_pct": bull_pct})
-    if len(market_history) < 3:
-        return None, None
-
-    recent = list(market_history)[-3:]
-    vals = [m["bull_pct"] for m in recent]
-    delta = vals[-1] - vals[0]
-
-    if delta >= 20:
-        return "up_strong", "⚠️ <b>Market Alert</b>\n🌊 השוק מתחיל לעלות בכוח"
-    if delta <= -20:
-        return "down_strong", "⚠️ <b>Market Alert</b>\n🌊 השוק מתחיל לרדת בכוח"
-    if vals[-1] >= 75 and all(v >= 65 for v in vals):
-        return "up_stable", "⚠️ <b>Market Alert</b>\n📈 מגמת עלייה יציבה בשוק"
-    if vals[-1] <= 25 and all(v <= 35 for v in vals):
-        return "down_stable", "⚠️ <b>Market Alert</b>\n📉 מגמת ירידה יציבה בשוק"
-    return None, None
-
-
-# =========================
-# Core scan
-# =========================
-
-def scan():
-    global last_market_alert_key
-
-    print("🔎 Scanning...", flush=True)
-    tickers = get_bybit_tickers()
-    if not tickers:
-        print("⚠️ No data", flush=True)
-        return
-
     now = time.time()
 
-    market_trend, bull_pct = analyze_market(tickers)
-    alert_key, alert_msg = detect_market_move(market_trend, bull_pct)
+    with lock:
+        # cooldown
+        last = alerted.get(symbol)
+        if last and (now - last) < ALERT_COOLDOWN_SEC:
+            return
 
-    if alert_key and alert_key != last_market_alert_key:
-        trend_emoji = "🟢" if market_trend == "bull" else "🔴" if market_trend == "bear" else "⚪"
-        market_msg = alert_msg + "\n" + trend_emoji + " " + str(round(bull_pct)) + "% מהמטבעות בעלייה"
-        send_telegram(market_msg)
-        last_market_alert_key = alert_key
-        print("📣 Market alert sent:", alert_key, flush=True)
+        prices = price_history[symbol]
+        if len(prices) < 30:
+            return
 
-    found = 0
+        meta = symbol_metadata.get(symbol, {})
+        oi = meta.get("oi", 0)
 
-    for t in tickers:
-        try:
-            symbol = t.get("symbol", "")
-            if not symbol:
-                continue
+        # OI filter
+        if oi < MIN_OI or oi > MAX_OI:
+            return
 
-            price = safe_float(t.get("lastPrice", 0))
-            change_24h = safe_float(t.get("price24hPcnt", 0)) * 100.0
-            turnover24h = safe_float(t.get("turnover24h", 0))
-            funding = safe_float(t.get("fundingRate", 0)) * 100.0
-            oi = safe_float(t.get("openInterestValue", 0))
+        funding = meta.get("funding", 0)
+        change_1m = calc_change(prices, 60)
+        change_3m = calc_change(prices, 180)
+        change_5m = calc_change(prices, 300)
 
-            if price <= 0:
-                continue
-            if oi < MIN_OI or oi > MAX_OI:
-                continue
+        signals = []
+        score = 0
 
-            st = get_state(symbol)
+        # LONG
+        if change_1m >= MOVE_1MIN_STRONG:
+            signals.append(f"🚀 +{round(change_1m, 1)}% תוך דקה!")
+            score += 4
+        if change_3m >= MOVE_3MIN_STRONG:
+            signals.append(f"📈 +{round(change_3m, 1)}% ב-3 דקות")
+            score += 3
+        if change_5m >= MOVE_5MIN_STRONG:
+            signals.append(f"⚡ +{round(change_5m, 1)}% ב-5 דקות")
+            score += 2
 
-            prev_turn = st["prev_turnover24h"]
-            if prev_turn is None:
-                st["prev_turnover24h"] = turnover24h
-                st["prices"].append((now, price))
-                st["oi"].append((now, oi))
-                st["funding"].append((now, funding))
-                continue
+        # SHORT
+        if change_1m <= -MOVE_1MIN_STRONG:
+            signals.append(f"💥 {round(change_1m, 1)}% תוך דקה!")
+            score += 4
+        if change_3m <= -MOVE_3MIN_STRONG:
+            signals.append(f"📉 {round(change_3m, 1)}% ב-3 דקות")
+            score += 3
+        if change_5m <= -MOVE_5MIN_STRONG:
+            signals.append(f"⚡ {round(change_5m, 1)}% ב-5 דקות")
+            score += 2
 
-            delta_turn = max(0.0, turnover24h - prev_turn)
-            st["prev_turnover24h"] = turnover24h
+        # acceleration
+        if abs(change_1m) > abs(change_3m) * 0.7 and abs(change_1m) >= 2.0:
+            signals.append("⚡ התנעה מואצת")
+            score += 2
 
-            st["prices"].append((now, price))
-            st["turnover_delta"].append((now, delta_turn))
-            st["oi"].append((now, oi))
-            st["funding"].append((now, funding))
+        if score < 4:
+            return
 
-            # Cooldown
-            if symbol in alerted and now - alerted[symbol] < ALERT_COOLDOWN_SEC:
-                continue
+        # direction rules (יותר יציב)
+        is_long = (change_1m > 0 and change_3m > 0)
+        is_short = (change_1m < 0 and change_3m < 0)
 
-            if len(st["prices"]) < 10:
-                continue
+        if not (is_long or is_short):
+            return
 
-            change_5m = price_change_over_lookback(st["prices"], now, LOOKBACK_5M_SEC)
-            change_15m = price_change_over_lookback(st["prices"], now, LOOKBACK_15M_SEC)
-            change_1h = price_change_over_lookback(st["prices"], now, LOOKBACK_1H_SEC)
+        direction = "🟢 LONG" if is_long else "🔴 SHORT"
 
-            acceleration = detect_price_acceleration(st["prices"], now)
-            structure = detect_structure_break(st["prices"], now)
+        if score >= 8:
+            strength = "🔥🔥🔥🔥 קריטי!"
+        elif score >= 6:
+            strength = "🔥🔥🔥 חזק מאוד"
+        else:
+            strength = "🔥🔥 חזק"
 
-            # Volume analysis
-            deltas = [x[1] for x in list(st["turnover_delta"])[-10:] if x[1] >= VOL_DELTA_MIN_USD]
-            vol_avg = calc_avg(deltas[:-1]) if len(deltas) >= 3 else None
-            vol_spike = (deltas[-1] / vol_avg) if vol_avg and vol_avg > 0 else 1.0
+        signals_txt = "\n".join(f"- {s}" for s in signals)
 
-            oi_trend = calc_oi_trend(st["oi"])
-            funding_trend = calc_funding_trend(st["funding"])
+        msg = (
+            f"{direction} <b>{symbol}</b>\n"
+            f"{strength}\n\n"
+            f"<b>סיגנלים:</b>\n{signals_txt}\n\n"
+            f"⏱️ 1m: {round(change_1m, 1)}% | 3m: {round(change_3m, 1)}% | 5m: {round(change_5m, 1)}%\n"
+            f"💵 מחיר: ${price}\n"
+            f"💹 Funding: {round(funding, 4)}%\n"
+            f"📊 OI: ${round(oi/1_000_000, 1)}M"
+        )
 
-            # ======================
-            # Filters
-            # ======================
-
-            if abs(change_1h) >= EXTREME_MOVE_1H:
-                continue
-
-            if abs(funding) >= FUNDING_EXTREME:
-                continue
-
-            if oi_trend < -2.0 and abs(change_15m) > 3:
-                continue
-
-            if vol_spike < 1.5 and abs(change_15m) > 5:
-                continue
-
-            # ======================
-            # Signals
-            # ======================
-
-            long_signals = []
-            short_signals = []
-
-            # LONG
-            if structure == "bullish_break":
-                long_signals.append(("🔥 שבירת מבנה Bullish", 4))
-
-            if acceleration >= ACCELERATION_THRESHOLD and change_5m > 0:
-                long_signals.append((f"⚡ האצה x{round(acceleration, 1)}", 3))
-
-            if vol_spike >= VOL_SPIKE_EXTREME and change_5m >= 0:
-                long_signals.append((f"💥 Volume פיצוץ x{round(vol_spike, 1)}", 4))
-            elif vol_spike >= VOL_SPIKE_STRONG and change_5m >= 0:
-                long_signals.append((f"💥 Volume spike x{round(vol_spike, 1)}", 3))
-            elif vol_spike >= VOL_SPIKE_MED and change_5m >= 0:
-                long_signals.append((f"Volume spike x{round(vol_spike, 1)}", 2))
-
-            if change_5m >= MOVE_EXPLOSIVE:
-                long_signals.append((f"🚀 +{round(change_5m, 1)}% ב-5 דקות!", 4))
-            elif change_5m >= MOVE_STRONG:
-                long_signals.append((f"📈 +{round(change_5m, 1)}% ב-5 דקות", 3))
-
-            if change_15m >= MOVE_STRONG and change_5m >= MOVE_MED:
-                long_signals.append((f"+{round(change_15m, 1)}% ב-15 דקות", 2))
-
-            if change_1h >= 3.0 and change_15m >= 2.0:
-                long_signals.append(("✅ 1H + 15M בכיוון", 3))
-            elif change_1h > 0 and change_15m >= MOVE_MED:
-                long_signals.append(("✅ 1H חיובי", 1))
-
-            if oi_trend >= 3.0 and change_5m >= 0:
-                long_signals.append(("📊 OI עולה חזק", 3))
-            elif oi_trend >= 2.0 and change_15m >= 0:
-                long_signals.append(("OI עולה", 2))
-
-            if funding_trend >= FUNDING_TREND and funding >= FUNDING_TREND and funding < FUNDING_HIGH:
-                long_signals.append(("💹 Funding מטפס", 2))
-            elif 0 < funding < 0.05:
-                long_signals.append(("✅ Funding בריא", 1))
-
-            if 5 <= change_24h <= 40:
-                long_signals.append((f"24h: +{round(change_24h, 1)}%", 1))
-
-            if market_trend == "bear" and change_15m >= 5:
-                long_signals.append(("⚡ חזק נגד שוק יורד", 3))
-
-            # SHORT
-            if structure == "bearish_break":
-                short_signals.append(("🔥 שבירת מבנה Bearish", 4))
-
-            if acceleration >= ACCELERATION_THRESHOLD and change_5m < 0:
-                short_signals.append((f"⚡ האצה x{round(acceleration, 1)}", 3))
-
-            if vol_spike >= VOL_SPIKE_EXTREME and change_5m <= 0:
-                short_signals.append((f"💥 Volume פיצוץ x{round(vol_spike, 1)}", 4))
-            elif vol_spike >= VOL_SPIKE_STRONG and change_5m <= 0:
-                short_signals.append((f"💥 Volume spike x{round(vol_spike, 1)}", 3))
-            elif vol_spike >= VOL_SPIKE_MED and change_5m <= 0:
-                short_signals.append((f"Volume spike x{round(vol_spike, 1)}", 2))
-
-            if change_5m <= -MOVE_EXPLOSIVE:
-                short_signals.append((f"💥 {round(change_5m, 1)}% ב-5 דקות!", 4))
-            elif change_5m <= -MOVE_STRONG:
-                short_signals.append((f"📉 {round(change_5m, 1)}% ב-5 דקות", 3))
-
-            if change_15m <= -MOVE_STRONG and change_5m <= -MOVE_MED:
-                short_signals.append((f"{round(change_15m, 1)}% ב-15 דקות", 2))
-
-            if change_1h <= -3.0 and change_15m <= -2.0:
-                short_signals.append(("✅ 1H + 15M בכיוון", 3))
-            elif change_1h < 0 and change_15m <= -MOVE_MED:
-                short_signals.append(("✅ 1H שלילי", 1))
-
-            if oi_trend >= 3.0 and change_5m <= -1.0:
-                short_signals.append(("📊 OI עולה + חולשה", 3))
-            elif oi_trend >= 2.0 and change_15m <= -0.5:
-                short_signals.append(("OI עולה + חולשה", 2))
-
-            if funding_trend <= -FUNDING_TREND and funding <= -FUNDING_TREND:
-                short_signals.append(("💹 Funding יורד", 2))
-            elif -0.05 < funding < 0:
-                short_signals.append(("✅ Funding בריא", 1))
-
-            if -40 <= change_24h <= -5:
-                short_signals.append((f"24h: {round(change_24h, 1)}%", 1))
-
-            if market_trend == "bull" and change_15m <= -5:
-                short_signals.append(("⚡ חלש נגד שוק עולה", 3))
-
-            # Block short on strong bullish momentum
-            if change_5m >= 3.0 or change_15m >= 5.0:
-                short_signals = []
-
-            # ======================
-            # Scoring
-            # ======================
-
-            long_score = sum(w for _, w in long_signals)
-            short_score = sum(w for _, w in short_signals)
-
-            is_pump = change_24h >= PUMP_24H_PCT
-            is_dump = change_24h <= DUMP_24H_PCT
-
-            if is_pump or is_dump:
-                conf = 0
-                if vol_spike >= 3.0:
-                    conf += 1
-                if oi_trend >= 2.0:
-                    conf += 1
-                if acceleration >= 1.5:
-                    conf += 1
-                if abs(change_5m) >= 3.0:
-                    conf += 1
-                if conf < 3:
-                    continue
-
-            long_has_extreme = any(w >= 4 for _, w in long_signals)
-            short_has_extreme = any(w >= 4 for _, w in short_signals)
-            long_has_strong = any(w >= 3 for _, w in long_signals)
-            short_has_strong = any(w >= 3 for _, w in short_signals)
-
-            long_qualifies = (long_score >= 6 and long_has_strong) or (long_score >= 5 and long_has_extreme)
-            short_qualifies = (short_score >= 6 and short_has_strong) or (short_score >= 5 and short_has_extreme)
-
-            if not long_qualifies and not short_qualifies:
-                continue
-
-            is_long = long_qualifies and long_score >= short_score
-            is_short = short_qualifies and short_score > long_score
-
-            if not (is_long or is_short):
-                continue
-
-            # ======================
-            # Build message
-            # ======================
-
-            if is_long:
-                direction = "🟢 LONG"
-                signals_used = long_signals
-                score = long_score
-            else:
-                direction = "🔴 SHORT"
-                signals_used = short_signals
-                score = short_score
-
-            if score >= 10:
-                strength = "🔥🔥🔥🔥🔥 קריטי!"
-            elif score >= 8:
-                strength = "🔥🔥🔥🔥 חזק מאוד"
-            elif score >= 6:
-                strength = "🔥🔥🔥 חזק"
-            else:
-                strength = "🔥🔥 בינוני-חזק"
-
-            if market_trend == "bull":
-                trend_txt = f"🌍 שוק: עולה ({round(bull_pct)}% ירוק)"
-            elif market_trend == "bear":
-                trend_txt = f"🌍 שוק: יורד ({round(100 - bull_pct)}% אדום)"
-            else:
-                trend_txt = "🌍 שוק: ניטרלי"
-
-            signals_txt = "\n".join("- " + s for s, _ in signals_used)
-            struct_txt = f"📊 Structure: {structure}\n" if structure != "none" else ""
-            accel_txt = f"⚡ Acceleration: x{round(acceleration, 1)}\n" if acceleration >= ACCELERATION_THRESHOLD else ""
-
-            msg = (
-                f"{direction} <b>{symbol}</b>\n"
-                f"{strength}\n\n"
-                f"<b>סיגנלים:</b>\n{signals_txt}\n\n"
-                f"{struct_txt}"
-                f"{accel_txt}"
-                f"⏱️ 5m: {round(change_5m, 1)}% | 15m: {round(change_15m, 1)}% | 1H: {round(change_1h, 1)}%\n"
-                f"📆 24h: {round(change_24h, 1)}%\n"
-                f"💵 מחיר: ${price}\n"
-                f"📦 ΔVolume: ${round(delta_turn/1_000_000, 2)}M | Spike: x{round(vol_spike, 1)}\n"
-                f"📊 OI Trend: {round(oi_trend, 1)}%\n"
-                f"💹 Funding: {round(funding, 4)}%\n"
-                f"{trend_txt}"
-            )
-
-            send_telegram(msg)
-            alerted[symbol] = now
-            found += 1
-            print(f"🎯 Alert: {symbol} {direction} score={score}", flush=True)
-
-        except Exception as e:
-            print("Loop error:", str(e), flush=True)
-            continue
-
-    print(f"✅ Scan done - {found} signals", flush=True)
+        send_telegram(msg)
+        alerted[symbol] = now
+        print(f"🎯 ALERT: {symbol} {direction} | 1m={round(change_1m,1)}% | score={score}", flush=True)
 
 
 # =========================
-# Main loop
+# WebSocket handlers
 # =========================
 
-print("🚀 Starting FAST scanner (scalping + swing optimized)…", flush=True)
-print(f"📊 Scan every {SCAN_INTERVAL_SEC}s | Cooldown: {ALERT_COOLDOWN_SEC/3600}h", flush=True)
-
-while True:
+def on_message(ws, message: str):
     try:
-        scan()
-    except Exception as e:
-        print("❌ Error:", str(e), flush=True)
+        data = json.loads(message)
 
-    time.sleep(SCAN_INTERVAL_SEC)
+        topic = data.get("topic")
+        if not topic or not topic.startswith("tickers."):
+            return
+
+        ticker_data = data.get("data") or {}
+        symbol = ticker_data.get("symbol") or ""
+        last_price = safe_float(ticker_data.get("lastPrice", 0))
+
+        if not symbol or last_price <= 0:
+            return
+
+        now = time.time()
+
+        with lock:
+            price_history[symbol].append((now, last_price))
+
+        check_signal(symbol, last_price)
+
+    except Exception as e:
+        print(f"Message error: {e}", flush=True)
+
+
+def on_error(ws, error):
+    print(f"WebSocket error: {error}", flush=True)
+
+
+def on_close(ws, close_status_code, close_msg):
+    print(f"WebSocket closed ({close_status_code}) {close_msg}", flush=True)
+    # reconnect handled by outer loop
+
+
+def on_open(ws):
+    print("WebSocket connected!", flush=True)
+
+    symbols = get_top_symbols()
+
+    batch_size = 50
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        topics = [f"tickers.{s}" for s in batch]
+
+        subscribe_msg = {"op": "subscribe", "args": topics}
+        ws.send(json.dumps(subscribe_msg))
+
+        print(f"Subscribed to {len(batch)} symbols (batch {i//batch_size + 1})", flush=True)
+        time.sleep(0.5)
+
+
+def start_websocket():
+    ws_url = "wss://stream.bybit.com/v5/public/linear"
+
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open
+    )
+
+    # ping כדי לשמור חיבור חי
+    ws.run_forever(ping_interval=20, ping_timeout=10)
+
+
+# =========================
+# Main
+# =========================
+
+if __name__ == "__main__":
+    print("🚀 Starting REAL-TIME scanner…", flush=True)
+    print("⚡ WebSocket: תופס תנועות תוך שניות", flush=True)
+
+    print("⏳ Waiting for initial metadata...", flush=True)
+    time.sleep(3)
+
+    while True:
+        try:
+            start_websocket()
+        except Exception as e:
+            print(f"WebSocket crashed: {e}", flush=True)
+
+        print("Reconnecting in 10s...", flush=True)
+        time.sleep(10)
