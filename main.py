@@ -7,7 +7,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
 # =========================
-# Railway HTTP keep-alive
+# Railway keep-alive server
 # =========================
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -17,29 +17,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Alive")
+        self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
         return
 
 
-def start_http():
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"✅ HTTP running on 0.0.0.0:{PORT}", flush=True)
-    server.serve_forever()
+def run_server():
+    print(f"✅ HTTP server listening on 0.0.0.0:{PORT}", flush=True)
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
-threading.Thread(target=start_http, daemon=True).start()
+threading.Thread(target=run_server, daemon=True).start()
 
 # =========================
 # Config - OPTIMIZED FOR SPEED
 # =========================
 
-SCAN_INTERVAL_SEC = 60             # every 1 minute
-LOOKBACK_5M_SEC = 300              # 5min for scalping
-LOOKBACK_15M_SEC = 900             # 15min for swing
-LOOKBACK_1H_SEC = 3600             # 1H for trend confirmation
-ALERT_COOLDOWN_SEC = 4 * 60 * 60   # 4 hours
+SCAN_INTERVAL_SEC = 60            # every 1 minute
+LOOKBACK_5M_SEC = 300            # 5min for scalping
+LOOKBACK_15M_SEC = 900           # 15min for swing
+LOOKBACK_1H_SEC = 3600           # 1H for trend confirmation
+ALERT_COOLDOWN_SEC = 4 * 60 * 60 # 4 hours
 
 # Filters
 MIN_OI = 1_000_000
@@ -69,7 +68,7 @@ FUNDING_TREND = 0.05
 # Price Acceleration
 ACCELERATION_THRESHOLD = 1.5
 
-# Large Order Detection (optional)
+# Large Order Detection
 LARGE_ORDER_MIN_USD = 500_000
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -88,11 +87,14 @@ last_market_alert_key = ""
 def get_state(symbol: str):
     if symbol not in symbol_state:
         symbol_state[symbol] = {
-            "prices": deque(maxlen=180),          # 3 hours of data (if 1min interval)
+            "prices": deque(maxlen=180),
             "turnover_delta": deque(maxlen=180),
             "oi": deque(maxlen=180),
             "funding": deque(maxlen=180),
             "prev_turnover24h": None,
+            "price_5m_ago": None,
+            "price_15m_ago": None,
+            "price_1h_ago": None,
         }
     return symbol_state[symbol]
 
@@ -117,7 +119,7 @@ def send_telegram(msg: str):
         requests.post(
             url,
             data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10,
+            timeout=10
         )
     except Exception as e:
         print("Telegram error:", str(e), flush=True)
@@ -131,6 +133,21 @@ def get_bybit_tickers():
         return data["result"]["list"]
     except Exception as e:
         print("Bybit error:", str(e), flush=True)
+        return []
+
+
+def get_recent_trades(symbol, limit=100):
+    """
+    Get recent trades to detect large orders
+    """
+    try:
+        url = f"https://api.bybit.com/v5/market/recent-trade?category=linear&symbol={symbol}&limit={limit}"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if data.get("retCode") != 0:
+            return []
+        return data["result"]["list"]
+    except Exception:
         return []
 
 
@@ -192,20 +209,46 @@ def detect_price_acceleration(prices_deque, now_ts):
     if len(prices_deque) < 20:
         return 1.0
 
-    recent_5m = price_change_over_lookback(prices_deque, now_ts, 300)          # last 5m
-    prev_10m = price_change_over_lookback(prices_deque, now_ts - 300, 600)     # 5-15m ago baseline
+    recent_5m = price_change_over_lookback(prices_deque, now_ts, 300)
+    prev_10m = price_change_over_lookback(prices_deque, now_ts - 300, 600)
 
     if abs(prev_10m) < 0.5 or prev_10m == 0:
         return 1.0
 
-    return abs(recent_5m) / abs(prev_10m)
+    ratio = abs(recent_5m) / abs(prev_10m)
+    return ratio
+
+
+def detect_large_orders(trades, price):
+    """
+    Detect whale orders from recent trades
+    Returns: (total_buy_usd, total_sell_usd, net_bias)
+    """
+    buy_volume = 0.0
+    sell_volume = 0.0
+
+    for trade in trades:
+        try:
+            size = safe_float(trade.get("size", 0))
+            side = trade.get("side", "")
+            trade_price = safe_float(trade.get("price", 0))
+            value_usd = size * trade_price
+
+            if side == "Buy":
+                buy_volume += value_usd
+            else:
+                sell_volume += value_usd
+        except Exception:
+            continue
+
+    net_bias = buy_volume - sell_volume
+    return buy_volume, sell_volume, net_bias
 
 
 def detect_structure_break(prices_deque, now_ts):
     """
     Simple structure break detection:
-    - Bullish: new high vs recent range
-    - Bearish: new low vs recent range
+    Returns: ("bullish_break", "bearish_break", "none")
     """
     if len(prices_deque) < 30:
         return "none"
@@ -226,8 +269,10 @@ def detect_structure_break(prices_deque, now_ts):
 
     if curr_price > recent_high * 1.005:
         return "bullish_break"
+
     if curr_price < recent_low * 0.995:
         return "bearish_break"
+
     return "none"
 
 
@@ -346,7 +391,6 @@ def scan():
             if len(st["prices"]) < 10:
                 continue
 
-            # Lookbacks
             change_5m = price_change_over_lookback(st["prices"], now, LOOKBACK_5M_SEC)
             change_15m = price_change_over_lookback(st["prices"], now, LOOKBACK_15M_SEC)
             change_1h = price_change_over_lookback(st["prices"], now, LOOKBACK_1H_SEC)
@@ -354,7 +398,7 @@ def scan():
             acceleration = detect_price_acceleration(st["prices"], now)
             structure = detect_structure_break(st["prices"], now)
 
-            # Volume spike
+            # Volume analysis
             deltas = [x[1] for x in list(st["turnover_delta"])[-10:] if x[1] >= VOL_DELTA_MIN_USD]
             vol_avg = calc_avg(deltas[:-1]) if len(deltas) >= 3 else None
             vol_spike = (deltas[-1] / vol_avg) if vol_avg and vol_avg > 0 else 1.0
@@ -368,10 +412,13 @@ def scan():
 
             if abs(change_1h) >= EXTREME_MOVE_1H:
                 continue
+
             if abs(funding) >= FUNDING_EXTREME:
                 continue
+
             if oi_trend < -2.0 and abs(change_15m) > 3:
                 continue
+
             if vol_spike < 1.5 and abs(change_15m) > 5:
                 continue
 
@@ -512,6 +559,10 @@ def scan():
             if not (is_long or is_short):
                 continue
 
+            # ======================
+            # Build message
+            # ======================
+
             if is_long:
                 direction = "🟢 LONG"
                 signals_used = long_signals
@@ -538,7 +589,6 @@ def scan():
                 trend_txt = "🌍 שוק: ניטרלי"
 
             signals_txt = "\n".join("- " + s for s, _ in signals_used)
-
             struct_txt = f"📊 Structure: {structure}\n" if structure != "none" else ""
             accel_txt = f"⚡ Acceleration: x{round(acceleration, 1)}\n" if acceleration >= ACCELERATION_THRESHOLD else ""
 
@@ -580,6 +630,6 @@ while True:
     try:
         scan()
     except Exception as e:
-        print("❌ Scan error:", str(e), flush=True)
+        print("❌ Error:", str(e), flush=True)
 
     time.sleep(SCAN_INTERVAL_SEC)
