@@ -37,10 +37,11 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 # Cooldowns
-ALERT_COOLDOWN_FAST_SEC = 45 * 60
-ALERT_COOLDOWN_SLOW_SEC = 6 * 60 * 60
+# ✅ changed: more alerts (without changing logic)
+ALERT_COOLDOWN_FAST_SEC = 15 * 60      # was 45*60
+ALERT_COOLDOWN_SLOW_SEC = 2 * 60 * 60  # was 6*60*60
 
-# ✅ Funding cooldown changed to 1 hour
+# ✅ Funding cooldown remains 1 hour
 ALERT_COOLDOWN_FUNDING_SEC = 60 * 60  # 1 hour (per symbol)
 
 # FAST movement thresholds
@@ -54,7 +55,7 @@ MOVE_15M = 8.0
 MOVE_1H = 15.0
 MOVE_24H = 30.0
 
-# Funding thresholds (early detection)
+# Funding thresholds (early detection)  ✅ unchanged
 FUNDING_EXTREME_POS = 0.5
 FUNDING_EXTREME_NEG = -0.5
 FUNDING_ABS_FOR_BOOST = 0.5
@@ -70,7 +71,7 @@ ALLOW_LOW_OI_IF_STRONG_MOVE = True
 LOW_OI_FAST_SCORE_BYPASS = 7
 
 # =========================
-# ✅ Only change you asked for earlier (Turnover)
+# Turnover (your previous change kept)
 # =========================
 MIN_TURNOVER_24H_NORMAL = 400_000
 MIN_TURNOVER_24H_EXPLOSIVE = 150_000
@@ -89,8 +90,8 @@ MIN_DEPTH_EXPLOSIVE_USDT = 8_000
 
 ENABLE_1M_VOLUME_FILTER = True
 
-# ✅ 1m turnover lowered for more alerts (sweet spot)
-MIN_1M_TURNOVER_USDT = 800
+# ✅ changed: allow more alerts through 1m turnover filter
+MIN_1M_TURNOVER_USDT = 300  # was 800
 
 # =========================
 # State
@@ -160,6 +161,16 @@ def strength_from_score(score: int) -> str:
     if score >= 7:
         return "🔥🔥🔥 חזק מאוד"
     return "🔥🔥 חזק"
+
+# ✅ added: trend label (does not change triggers, only adds info to message)
+def trend_label(change_15m: float, change_1h: float, change_24h: float) -> str:
+    if change_15m >= 1.0 and change_1h >= 2.0:
+        return "📈 מגמה: עולה"
+    if change_15m <= -1.0 and change_1h <= -2.0:
+        return "📉 מגמה: יורדת"
+    if abs(change_24h) >= 10:
+        return "➖ מגמה: מעורבת (24h חזק)"
+    return "➖ מגמה: צדית/מעורבת"
 
 def update_anchors(symbol: str, ts: float, price: float):
     with lock:
@@ -351,7 +362,7 @@ def pass_oi_gate(symbol: str, fast_score: int, change_24h: float) -> bool:
 # Alerts
 # =========================
 
-def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score):
+def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score, trend):
     with lock:
         meta = symbol_metadata.get(symbol, {})
         oi = meta.get("oi", 0)
@@ -362,7 +373,8 @@ def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, sco
 
     msg = (
         f"{direction} <b>{symbol}</b>\n"
-        f"{strength_from_score(score)}\n\n"
+        f"{strength_from_score(score)}\n"
+        f"{trend}\n\n"
         f"<b>סיגנלים (מהיר):</b>\n"
         + "\n".join(f"- {s}" for s in signals)
         + "\n\n"
@@ -373,7 +385,7 @@ def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, sco
     )
     send_telegram(msg)
 
-def send_slow_alert(symbol, price, change_15m, change_1h, change_24h):
+def send_slow_alert(symbol, price, change_15m, change_1h, change_24h, trend):
     with lock:
         meta = symbol_metadata.get(symbol, {})
         oi = meta.get("oi", 0)
@@ -399,7 +411,8 @@ def send_slow_alert(symbol, price, change_15m, change_1h, change_24h):
 
     msg = (
         f"{direction} <b>{symbol}</b>\n"
-        f"{strength}\n\n"
+        f"{strength}\n"
+        f"{trend}\n\n"
         f"<b>סיגנלים (איטי):</b>\n"
         + ("\n".join(f"- {s}" for s in signals) if signals else "- תנועה משמעותית")
         + "\n\n"
@@ -496,6 +509,9 @@ def check_signals(symbol, price):
     change_15m = pct_change(t15[1], price) if t15 else 0.0
     change_1h = pct_change(t60[1], price) if t60 else 0.0
 
+    # ✅ added: trend label (used in both fast & slow messages)
+    trend = trend_label(change_15m, change_1h, change_24h)
+
     # OI gate
     if not pass_oi_gate(symbol, score, change_24h):
         return
@@ -547,7 +563,7 @@ def check_signals(symbol, price):
             with lock:
                 last = last_alert_fast.get(symbol)
             if (last is None) or (ts - last >= ALERT_COOLDOWN_FAST_SEC):
-                send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score)
+                send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score, trend)
                 with lock:
                     last_alert_fast[symbol] = ts
 
@@ -561,7 +577,7 @@ def check_signals(symbol, price):
         with lock:
             last = last_alert_slow.get(symbol)
         if (last is None) or (ts - last >= ALERT_COOLDOWN_SLOW_SEC):
-            send_slow_alert(symbol, price, change_15m, change_1h, change_24h)
+            send_slow_alert(symbol, price, change_15m, change_1h, change_24h, trend)
             with lock:
                 last_alert_slow[symbol] = ts
 
