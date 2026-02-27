@@ -39,7 +39,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 # Cooldowns
 ALERT_COOLDOWN_FAST_SEC = 45 * 60       # 45 minutes
 ALERT_COOLDOWN_SLOW_SEC = 6 * 60 * 60   # 6 hours
-ALERT_COOLDOWN_FUNDING_SEC = 2 * 60 * 60  # funding timing + extreme
+ALERT_COOLDOWN_FUNDING_SEC = 2 * 60 * 60  # funding extreme alert cooldown
 
 # FAST movement thresholds (minutes)
 MOVE_EXPLOSIVE_1M = 10.0
@@ -53,14 +53,10 @@ MOVE_1H = 15.0
 MOVE_24H = 30.0
 
 # Funding extreme thresholds (in %)
-# (שומר אותו דבר כמו שביקשת)
-FUNDING_EXTREME_POS = 1.0     # +1% and above
-FUNDING_EXTREME_NEG = -1.0    # -1% and below
-FUNDING_ABS_FOR_BOOST = 0.5   # funding>|0.5| boosts score if move signal exists
-
-# Funding timing alerts
-FUNDING_SOON_WINDOW_SEC = 30 * 60      # 30 דקות לפני התשלום
-FUNDING_IMMINENT_WINDOW_SEC = 7 * 60   # 7 דקות לפני התשלום (רק אם קיצוני)
+# ✅ Changed to 0.5% to catch earlier, as you requested
+FUNDING_EXTREME_POS = 0.5     # +0.5% and above
+FUNDING_EXTREME_NEG = -0.5    # -0.5% and below
+FUNDING_ABS_FOR_BOOST = 0.5   # keep as-is: boosts score if move signal exists
 
 # Tracking size and refresh
 TOP_N_SYMBOLS = 500
@@ -74,9 +70,9 @@ MAX_OI = 800_000_000
 ALLOW_LOW_OI_IF_STRONG_MOVE = True
 LOW_OI_FAST_SCORE_BYPASS = 7
 
-# -------- Anti-stuck (liquidity) - dynamic (לא לפספס) --------
-MIN_TURNOVER_24H_NORMAL = 1_000_000     # סיגנל רגיל – לפחות 1M USDT מחזור יומי
-MIN_TURNOVER_24H_EXPLOSIVE = 250_000    # EXPLOSIVE – גם 250K מספיק
+# -------- Anti-stuck (liquidity) - dynamic (you said: don't miss, but don't get stuck) --------
+MIN_TURNOVER_24H_NORMAL = 1_000_000     # normal signal needs >= 1M USDT 24h turnover
+MIN_TURNOVER_24H_EXPLOSIVE = 250_000    # explosive allows >= 250K USDT 24h turnover
 
 # --- Advanced anti-stuck liquidity filters (only checked when score >= 4) ---
 ORDERBOOK_TTL_SEC = 25  # cache orderbook per symbol
@@ -102,24 +98,17 @@ MIN_1M_TURNOVER_USDT = 3_000
 
 lock = threading.Lock()
 
-# symbol -> deque of (timestamp, price)
 price_history = defaultdict(lambda: deque(maxlen=2500))
-
-# symbol -> metadata
 symbol_metadata = {}
 
-# cooldown states
 last_alert_fast = {}
 last_alert_slow = {}
-last_alert_funding = {}  # we'll use keys like symbol+"_soon", symbol+"_imminent", symbol+"_extreme"
+last_alert_funding = {}  # key: symbol+"_extreme"
 
-# anchors for 15m and 1h
 anchors = {}
 
-# orderbook cache (no lock needed; best effort)
 orderbook_cache = {}  # symbol -> {"ts": float, "ok": bool, "spread_pct": float, "payload": dict|None}
 
-# websocket global
 ws_app = None
 ws_lock = threading.Lock()
 current_symbols = []
@@ -159,9 +148,6 @@ def send_telegram(msg: str):
         print(f"Telegram error: {e}", flush=True)
 
 def calc_change(prices_list: list, lookback_sec: int) -> float:
-    """
-    prices_list: list of (timestamp, price), sorted by time.
-    """
     if len(prices_list) < 2:
         return 0.0
     target_time = now_ts() - lookback_sec
@@ -196,11 +182,6 @@ def update_anchors(symbol: str, ts: float, price: float):
         anchors[symbol] = a
 
 def fetch_orderbook_metrics(symbol: str):
-    """
-    Returns (ok, spread_pct, payload)
-    payload = {"mid": mid, "bids": bids, "asks": asks}
-    bids/asks are lists of [price, size]
-    """
     try:
         url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=50"
         r = requests.get(url, timeout=6)
@@ -227,9 +208,6 @@ def fetch_orderbook_metrics(symbol: str):
         return (False, 0.0, None)
 
 def calc_depth_within_band(payload, band_pct: float) -> float:
-    """
-    Depth in USDT within +/- band_pct% from mid: (bid_depth + ask_depth)
-    """
     try:
         mid = payload["mid"]
         bids = payload["bids"]
@@ -270,9 +248,6 @@ def get_orderbook_cached(symbol: str):
     return c
 
 def fetch_1m_turnover_usdt(symbol: str) -> float:
-    """
-    Bybit kline: last 1m candle turnover (USDT).
-    """
     try:
         url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit=1"
         r = requests.get(url, timeout=6)
@@ -281,7 +256,6 @@ def fetch_1m_turnover_usdt(symbol: str) -> float:
         if not lst:
             return 0.0
         candle = lst[0]
-        # format usually: [start, open, high, low, close, volume, turnover]
         if len(candle) > 6:
             return safe_float(candle[6], 0)
         return 0.0
@@ -314,16 +288,12 @@ def update_metadata():
                 volume24h = safe_float(t.get("volume24h", 0))
                 price24h_pcnt = safe_float(t.get("price24hPcnt", 0)) * 100.0
 
-                # ✅ NEW: next funding time (ms timestamp usually)
-                next_funding_ms = safe_float(t.get("nextFundingTime", 0))
-
                 local[symbol] = {
                     "oi": oi,
                     "turnover24h": turnover24h,
                     "funding": funding,
                     "volume24h": volume24h,
                     "price24hPcnt": price24h_pcnt,
-                    "nextFundingTimeMs": next_funding_ms,
                     "last_update": ts
                 }
 
@@ -458,28 +428,15 @@ def send_slow_alert(symbol, price, change_15m, change_1h, change_24h):
     )
     send_telegram(msg)
 
-def send_funding_timing_alert(symbol: str, funding: float, price: float, minutes_left: int, kind: str):
-    # kind: "soon" / "imminent"
-    title = "⏳ <b>Funding Soon</b>" if kind == "soon" else "🚨 <b>Funding IMMINENT</b>"
-    extra = "" if kind == "soon" else "\n⚠️ Funding קיצוני + תשלום קרוב = תנודתיות/סליפג׳ אפשריים"
-    msg = (
-        f"{title} <b>{symbol}</b>\n\n"
-        f"💹 Funding: <b>{round(funding,4)}%</b> ({'Short pays Long' if funding < 0 else 'Long pays Short'})\n"
-        f"🕒 לתשלום בעוד: <b>{minutes_left} דקות</b>\n"
-        f"💵 מחיר: ${price}"
-        f"{extra}"
-    )
-    send_telegram(msg)
-
 def send_funding_extreme_alert(symbol: str, funding: float, price: float):
     direction = "🟢 Bias LONG" if funding < 0 else "🔴 Bias SHORT"
     msg = (
         f"{direction} <b>{symbol}</b>\n"
-        f"⚠️ <b>Funding קיצוני</b>\n\n"
+        f"⚠️ <b>Funding חריג</b>\n\n"
         f"💹 Funding: <b>{round(funding,4)}%</b>\n"
         f"🧾 מצב: {'Short pays Long' if funding < 0 else 'Long pays Short'}\n"
         f"💵 מחיר: ${price}\n\n"
-        f"🔎 Funding קיצוני = שוק לא מאוזן (סיכון)."
+        f"🔎 זה לא סיגנל כניסה. רק אזהרה שחוסר איזון מתחיל."
     )
     send_telegram(msg)
 
@@ -490,11 +447,10 @@ def send_funding_extreme_alert(symbol: str, funding: float, price: float):
 def check_signals(symbol: str, price: float):
     ts = now_ts()
 
-    # --- take snapshots under lock (no network while locked) ---
+    # snapshots (no network under lock)
     with lock:
         prices_list = list(price_history[symbol])
         meta = symbol_metadata.get(symbol, {}).copy()
-        a = anchors.get(symbol, {}).copy()
 
     if len(prices_list) < 5:
         return
@@ -502,7 +458,6 @@ def check_signals(symbol: str, price: float):
     funding = meta.get("funding", 0.0)
     change_24h = meta.get("price24hPcnt", 0.0)
     turnover24h = meta.get("turnover24h", 0.0)
-    next_ms = meta.get("nextFundingTimeMs", 0.0)
 
     # FAST changes
     change_1m = calc_change(prices_list, 60)
@@ -554,7 +509,7 @@ def check_signals(symbol: str, price: float):
         signals.append(f"💹 Funding חריג: {round(funding, 4)}%")
         score += 2
 
-    # Update anchors (stored) – do it outside meta snapshot
+    # Update anchors
     update_anchors(symbol, ts, price)
     with lock:
         a2 = anchors.get(symbol, {}).copy()
@@ -574,36 +529,7 @@ def check_signals(symbol: str, price: float):
     if turnover24h < min_turnover:
         return
 
-    # ===== Funding timing alerts (Soon + Imminent) =====
-    if next_ms and next_ms > 0:
-        secs_to_funding = (next_ms / 1000.0) - ts
-
-        # Soon (30m)
-        if 0 < secs_to_funding <= FUNDING_SOON_WINDOW_SEC:
-            key = symbol + "_soon"
-            with lock:
-                last = last_alert_funding.get(key)
-            if (last is None) or (ts - last >= ALERT_COOLDOWN_FUNDING_SEC):
-                minutes_left = int(secs_to_funding // 60)
-                send_funding_timing_alert(symbol, funding, price, minutes_left, "soon")
-                with lock:
-                    last_alert_funding[key] = ts
-
-        # Imminent (7m) only if extreme funding
-        if (
-            0 < secs_to_funding <= FUNDING_IMMINENT_WINDOW_SEC and
-            (funding <= FUNDING_EXTREME_NEG or funding >= FUNDING_EXTREME_POS)
-        ):
-            key = symbol + "_imminent"
-            with lock:
-                last = last_alert_funding.get(key)
-            if (last is None) or (ts - last >= ALERT_COOLDOWN_FUNDING_SEC):
-                minutes_left = int(secs_to_funding // 60)
-                send_funding_timing_alert(symbol, funding, price, minutes_left, "imminent")
-                with lock:
-                    last_alert_funding[key] = ts
-
-    # ===== Funding extreme alert (kept as-is) =====
+    # ===== Funding extreme alert (ONLY this; Soon/Imminent removed) =====
     if funding <= FUNDING_EXTREME_NEG or funding >= FUNDING_EXTREME_POS:
         key = symbol + "_extreme"
         with lock:
@@ -615,7 +541,6 @@ def check_signals(symbol: str, price: float):
 
     # ===== Advanced anti-stuck filters (only when score >= 4) =====
     if score >= 4:
-        # orderbook
         obc = get_orderbook_cached(symbol)
         if obc.get("ok") and obc.get("payload"):
             spread_pct = obc.get("spread_pct", 0.0)
@@ -632,7 +557,6 @@ def check_signals(symbol: str, price: float):
             if depth_usdt < min_depth:
                 return
 
-        # last 1m turnover
         if ENABLE_1M_VOLUME_FILTER:
             t1m = fetch_1m_turnover_usdt(symbol)
             if t1m < MIN_1M_TURNOVER_USDT:
@@ -642,7 +566,6 @@ def check_signals(symbol: str, price: float):
     if score >= 4:
         is_long = (change_1m > 0 and change_3m > 0)
         is_short = (change_1m < 0 and change_3m < 0)
-
         if is_long or is_short:
             with lock:
                 last = last_alert_fast.get(symbol)
