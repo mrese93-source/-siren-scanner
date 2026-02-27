@@ -9,7 +9,7 @@ import requests
 import websocket  # pip install websocket-client
 
 # =========================
-# Railway keep-alive server
+# Railway keep-alive
 # =========================
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -36,88 +36,43 @@ threading.Thread(target=run_server, daemon=True).start()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Cooldowns
-# ✅ changed: more alerts (without changing logic)
-ALERT_COOLDOWN_FAST_SEC = 15 * 60      # was 45*60
-ALERT_COOLDOWN_SLOW_SEC = 2 * 60 * 60  # was 6*60*60
+# Alert cooldown (signals)
+ALERT_COOLDOWN_SEC = 4 * 60 * 60  # 4 hours
 
-# ✅ Funding cooldown remains 1 hour
-ALERT_COOLDOWN_FUNDING_SEC = 60 * 60  # 1 hour (per symbol)
+# ✅ Funding alert cooldown (separate, per symbol)
+FUNDING_ALERT_COOLDOWN_SEC = 60 * 60  # 1 hour
 
-# FAST movement thresholds
-MOVE_EXPLOSIVE_1M = 10.0
-MOVE_1M = 2.5
-MOVE_3M = 4.0
-MOVE_5M = 5.0
-
-# SLOW movement thresholds
-MOVE_15M = 8.0
-MOVE_1H = 15.0
-MOVE_24H = 30.0
-
-# Funding thresholds (early detection)  ✅ unchanged
-FUNDING_EXTREME_POS = 0.5
-FUNDING_EXTREME_NEG = -0.5
-FUNDING_ABS_FOR_BOOST = 0.5
-
-TOP_N_SYMBOLS = 500
-RESUBSCRIBE_EVERY_SEC = 10 * 60
+# Movement thresholds (real-time)
+MOVE_EXPLOSIVE = 10.0
+MOVE_1MIN_STRONG = 2.5
+MOVE_3MIN_STRONG = 4.0
+MOVE_5MIN_STRONG = 5.0
 
 # OI filter
-MIN_OI_SOFT = 50_000
-MAX_OI = 800_000_000
+MIN_OI = 100_000
+MAX_OI = 500_000_000
 
-ALLOW_LOW_OI_IF_STRONG_MOVE = True
-LOW_OI_FAST_SCORE_BYPASS = 7
+# ✅ Funding extreme thresholds (in % because we multiply by 100 below)
+FUNDING_EXTREME_NEGATIVE = -0.5
+FUNDING_EXTREME_POSITIVE = 0.5
 
-# =========================
-# Turnover (your previous change kept)
-# =========================
-MIN_TURNOVER_24H_NORMAL = 400_000
-MIN_TURNOVER_24H_EXPLOSIVE = 150_000
-
-# Liquidity filters
-ORDERBOOK_TTL_SEC = 25
-
-MAX_SPREAD_NORMAL_PCT = 0.45
-MAX_SPREAD_EXPLOSIVE_PCT = 0.80
-
-DEPTH_BAND_NORMAL_PCT = 0.50
-DEPTH_BAND_EXPLOSIVE_PCT = 0.80
-
-MIN_DEPTH_NORMAL_USDT = 20_000
-MIN_DEPTH_EXPLOSIVE_USDT = 8_000
-
-ENABLE_1M_VOLUME_FILTER = True
-
-# ✅ changed: allow more alerts through 1m turnover filter
-MIN_1M_TURNOVER_USDT = 300  # was 800
+# Track top symbols count (same as your 150)
+TOP_SYMBOLS = 150
 
 # =========================
 # State
 # =========================
 
+price_history = defaultdict(lambda: deque(maxlen=600))  # ~10 min history
+alerted = {}            # last signal alert time per symbol
+funding_alerted = {}    # ✅ last funding-only alert time per symbol
+symbol_metadata = {}    # updated every 30s
+
 lock = threading.Lock()
-price_history = defaultdict(lambda: deque(maxlen=2500))
-symbol_metadata = {}
-
-last_alert_fast = {}
-last_alert_slow = {}
-last_alert_funding = {}  # prevents funding spam per symbol
-
-anchors = {}
-orderbook_cache = {}
-
-ws_app = None
-ws_lock = threading.Lock()
-current_symbols = []
 
 # =========================
 # Utils
 # =========================
-
-def now_ts():
-    return time.time()
 
 def safe_float(x, default=0.0):
     try:
@@ -125,178 +80,80 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
-def pct_change(old, new):
-    if old <= 0:
-        return 0.0
-    return ((new - old) / old) * 100.0
-
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("⚠️ Missing TELEGRAM_TOKEN or CHAT_ID", flush=True)
-        return
+def send_telegram(msg: str):
     try:
+        if not TELEGRAM_TOKEN or not CHAT_ID:
+            print("⚠️ Missing TELEGRAM_TOKEN or CHAT_ID", flush=True)
+            return
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
+        r = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
         if r.status_code != 200:
             print(f"Telegram API error: {r.status_code} {r.text}", flush=True)
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
 
-def calc_change(prices_list, lookback_sec):
-    if len(prices_list) < 2:
+def calc_change(prices, lookback_sec):
+    """
+    Calculate price change over last N seconds
+    prices: deque of (timestamp, price)
+    """
+    if len(prices) < 2:
         return 0.0
-    target_time = now_ts() - lookback_sec
+
+    now = time.time()
+    target_time = now - lookback_sec
+
     old_price = None
-    for ts, p in prices_list:
+    for ts, p in prices:
         if ts >= target_time:
             old_price = p
             break
-    if old_price is None:
-        return 0.0
-    return pct_change(old_price, prices_list[-1][1])
 
-def strength_from_score(score: int) -> str:
-    if score >= 10:
-        return "🔥🔥🔥🔥 קריטי!"
-    if score >= 7:
-        return "🔥🔥🔥 חזק מאוד"
-    return "🔥🔥 חזק"
-
-# ✅ added: trend label (does not change triggers, only adds info to message)
-def trend_label(change_15m: float, change_1h: float, change_24h: float) -> str:
-    if change_15m >= 1.0 and change_1h >= 2.0:
-        return "📈 מגמה: עולה"
-    if change_15m <= -1.0 and change_1h <= -2.0:
-        return "📉 מגמה: יורדת"
-    if abs(change_24h) >= 10:
-        return "➖ מגמה: מעורבת (24h חזק)"
-    return "➖ מגמה: צדית/מעורבת"
-
-def update_anchors(symbol: str, ts: float, price: float):
-    with lock:
-        a = anchors.get(symbol, {})
-
-        t15 = a.get("t15")
-        if (t15 is None) or (ts - t15[0] > 20 * 60):
-            a["t15"] = (ts, price)
-
-        t60 = a.get("t60")
-        if (t60 is None) or (ts - t60[0] > 75 * 60):
-            a["t60"] = (ts, price)
-
-        anchors[symbol] = a
-
-def fetch_orderbook_metrics(symbol: str):
-    try:
-        url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=50"
-        r = requests.get(url, timeout=6)
-        data = r.json()
-        ob = data.get("result", {}) or {}
-        bids = ob.get("b", []) or []
-        asks = ob.get("a", []) or []
-
-        if not bids or not asks:
-            return (False, 0.0, None)
-
-        best_bid = safe_float(bids[0][0], 0)
-        best_ask = safe_float(asks[0][0], 0)
-        if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
-            return (False, 0.0, None)
-
-        mid = (best_bid + best_ask) / 2.0
-        spread_pct = ((best_ask - best_bid) / mid) * 100.0
-
-        payload = {"mid": mid, "bids": bids, "asks": asks}
-        return (True, spread_pct, payload)
-
-    except Exception:
-        return (False, 0.0, None)
-
-def calc_depth_within_band(payload, band_pct: float) -> float:
-    try:
-        mid = payload["mid"]
-        bids = payload["bids"]
-        asks = payload["asks"]
-
-        lower = mid * (1.0 - band_pct / 100.0)
-        upper = mid * (1.0 + band_pct / 100.0)
-
-        bid_depth = 0.0
-        for px, qty in bids:
-            p = safe_float(px, 0)
-            q = safe_float(qty, 0)
-            if p < lower:
-                break
-            bid_depth += p * q
-
-        ask_depth = 0.0
-        for px, qty in asks:
-            p = safe_float(px, 0)
-            q = safe_float(qty, 0)
-            if p > upper:
-                break
-            ask_depth += p * q
-
-        return bid_depth + ask_depth
-    except Exception:
+    if old_price is None or old_price == 0:
         return 0.0
 
-def get_orderbook_cached(symbol: str):
-    ts = now_ts()
-    c = orderbook_cache.get(symbol)
-    if c and (ts - c["ts"] <= ORDERBOOK_TTL_SEC):
-        return c
-
-    ok, spread_pct, payload = fetch_orderbook_metrics(symbol)
-    c = {"ts": ts, "ok": ok, "spread_pct": spread_pct, "payload": payload}
-    orderbook_cache[symbol] = c
-    return c
-
-def fetch_1m_turnover_usdt(symbol: str) -> float:
-    try:
-        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit=1"
-        r = requests.get(url, timeout=6)
-        data = r.json()
-        lst = data.get("result", {}).get("list", []) or []
-        if not lst:
-            return 0.0
-        candle = lst[0]
-        if len(candle) > 6:
-            return safe_float(candle[6], 0)
-        return 0.0
-    except Exception:
-        return 0.0
+    curr_price = prices[-1][1]
+    return ((curr_price - old_price) / old_price) * 100.0
 
 # =========================
-# Metadata updater
+# Metadata updater (REST every 30s)
 # =========================
 
 def update_metadata():
+    """
+    Fetch OI, volume, funding from REST API every 30s
+    """
     while True:
         try:
-            r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10)
-            data = r.json().get("result", {}).get("list", [])
-            ts = now_ts()
-
-            local = {}
-            for t in data:
-                symbol = t.get("symbol")
-                if not symbol:
-                    continue
-
-                local[symbol] = {
-                    "oi": safe_float(t.get("openInterestValue", 0)),
-                    "turnover24h": safe_float(t.get("turnover24h", 0)),
-                    "funding": safe_float(t.get("fundingRate", 0)) * 100.0,
-                    "volume24h": safe_float(t.get("volume24h", 0)),
-                    "price24hPcnt": safe_float(t.get("price24hPcnt", 0)) * 100.0,
-                    "last_update": ts
-                }
+            url = "https://api.bybit.com/v5/market/tickers?category=linear"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            tickers = (data.get("result") or {}).get("list", []) or []
 
             with lock:
-                symbol_metadata.update(local)
+                for t in tickers:
+                    symbol = t.get("symbol", "")
+                    if not symbol:
+                        continue
 
-            print(f"✅ Updated metadata for {len(local)} symbols", flush=True)
+                    oi = safe_float(t.get("openInterestValue", 0))
+                    turnover24h = safe_float(t.get("turnover24h", 0))
+                    funding = safe_float(t.get("fundingRate", 0)) * 100.0  # ✅ %
+                    volume24h = safe_float(t.get("volume24h", 0))
+
+                    symbol_metadata[symbol] = {
+                        "oi": oi,
+                        "turnover24h": turnover24h,
+                        "funding": funding,
+                        "volume24h": volume24h,
+                        "last_update": time.time()
+                    }
+
+            print(f"✅ Updated metadata for {len(tickers)} symbols", flush=True)
 
         except Exception as e:
             print(f"Metadata error: {e}", flush=True)
@@ -306,284 +163,193 @@ def update_metadata():
 threading.Thread(target=update_metadata, daemon=True).start()
 
 # =========================
-# Symbols selection
+# Funding alert (ONLY funding extreme)
 # =========================
 
-def get_top_symbols():
-    try:
-        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10)
-        tickers = r.json().get("result", {}).get("list", []) or []
+def maybe_send_funding_alert(symbol: str, funding: float, price: float):
+    """
+    Sends a separate alert only when funding is extreme (>= 0.5% or <= -0.5%),
+    with 1h cooldown per symbol to prevent spam.
+    """
+    if not (funding >= FUNDING_EXTREME_POSITIVE or funding <= FUNDING_EXTREME_NEGATIVE):
+        return
 
-        valid = []
-        for t in tickers:
-            symbol = t.get("symbol") or ""
-            if not symbol:
-                continue
+    now = time.time()
+    last = funding_alerted.get(symbol)
+    if last is not None and (now - last) < FUNDING_ALERT_COOLDOWN_SEC:
+        return
 
-            turnover = safe_float(t.get("turnover24h", 0))
-            oi = safe_float(t.get("openInterestValue", 0))
-
-            if turnover <= 0:
-                continue
-            if oi > MAX_OI:
-                continue
-
-            score = turnover + (oi * 0.01)
-            valid.append((symbol, score))
-
-        valid.sort(key=lambda x: x[1], reverse=True)
-        symbols = [s for s, _ in valid[:TOP_N_SYMBOLS]]
-
-        print(f"📡 Tracking {len(symbols)} symbols (Top{TOP_N_SYMBOLS})", flush=True)
-        return symbols
-
-    except Exception as e:
-        print(f"Error getting symbols: {e}", flush=True)
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-
-# =========================
-# OI gate
-# =========================
-
-def pass_oi_gate(symbol: str, fast_score: int, change_24h: float) -> bool:
-    with lock:
-        meta = symbol_metadata.get(symbol, {})
-    oi = meta.get("oi", 0)
-
-    if MIN_OI_SOFT <= oi <= MAX_OI:
-        return True
-    if abs(change_24h) >= MOVE_24H:
-        return True
-    if ALLOW_LOW_OI_IF_STRONG_MOVE and fast_score >= LOW_OI_FAST_SCORE_BYPASS:
-        return True
-    return False
-
-# =========================
-# Alerts
-# =========================
-
-def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score, trend):
-    with lock:
-        meta = symbol_metadata.get(symbol, {})
-        oi = meta.get("oi", 0)
-        funding = meta.get("funding", 0)
-
-    is_long = (change_1m > 0 and change_3m > 0)
-    direction = "🟢 LONG" if is_long else "🔴 SHORT"
-
-    msg = (
-        f"{direction} <b>{symbol}</b>\n"
-        f"{strength_from_score(score)}\n"
-        f"{trend}\n\n"
-        f"<b>סיגנלים (מהיר):</b>\n"
-        + "\n".join(f"- {s}" for s in signals)
-        + "\n\n"
-        f"⏱️ 1m: {round(change_1m,1)}% | 3m: {round(change_3m,1)}% | 5m: {round(change_5m,1)}%\n"
-        f"💵 מחיר: ${price}\n"
-        f"💹 Funding: {round(funding,4)}% ({'Short pays Long' if funding < 0 else 'Long pays Short'})\n"
-        f"📊 OI: ${round(oi/1_000_000,3)}M"
-    )
-    send_telegram(msg)
-
-def send_slow_alert(symbol, price, change_15m, change_1h, change_24h, trend):
-    with lock:
-        meta = symbol_metadata.get(symbol, {})
-        oi = meta.get("oi", 0)
-        funding = meta.get("funding", 0)
-
-    direction = "🟢 LONG" if (change_1h > 0 or change_24h > 0) else "🔴 SHORT"
-    max_move = max(abs(change_15m), abs(change_1h), abs(change_24h))
-
-    if max_move >= 50:
-        strength = "🔥🔥🔥🔥 תנועה חריגה מאוד"
-    elif max_move >= 30:
-        strength = "🔥🔥🔥 חזק מאוד"
-    else:
-        strength = "🔥🔥 חזק"
-
-    signals = []
-    if abs(change_15m) >= MOVE_15M:
-        signals.append(f"⏳ 15m: {round(change_15m,1)}%")
-    if abs(change_1h) >= MOVE_1H:
-        signals.append(f"🕐 1h: {round(change_1h,1)}%")
-    if abs(change_24h) >= MOVE_24H:
-        signals.append(f"📅 24h: {round(change_24h,1)}%")
-
-    msg = (
-        f"{direction} <b>{symbol}</b>\n"
-        f"{strength}\n"
-        f"{trend}\n\n"
-        f"<b>סיגנלים (איטי):</b>\n"
-        + ("\n".join(f"- {s}" for s in signals) if signals else "- תנועה משמעותית")
-        + "\n\n"
-        f"💵 מחיר: ${price}\n"
-        f"💹 Funding: {round(funding,4)}% ({'Short pays Long' if funding < 0 else 'Long pays Short'})\n"
-        f"📊 OI: ${round(oi/1_000_000,3)}M"
-    )
-    send_telegram(msg)
-
-def send_funding_extreme_alert(symbol: str, funding: float, price: float):
     direction = "🟢 Bias LONG" if funding < 0 else "🔴 Bias SHORT"
+    state = "Short pays Long" if funding < 0 else "Long pays Short"
+
     msg = (
         f"{direction} <b>{symbol}</b>\n"
         f"⚠️ <b>Funding חריג</b>\n\n"
-        f"💹 Funding: <b>{round(funding,4)}%</b>\n"
-        f"🧾 מצב: {'Short pays Long' if funding < 0 else 'Long pays Short'}\n"
+        f"💹 Funding: <b>{round(funding, 4)}%</b> ({state})\n"
         f"💵 מחיר: ${price}\n"
     )
+
     send_telegram(msg)
+    funding_alerted[symbol] = now
+    print(f"⚠️ FUNDING ALERT: {symbol} funding={funding}%", flush=True)
 
 # =========================
-# Core signal checker
+# Signal checker
 # =========================
 
-def check_signals(symbol, price):
-    ts = now_ts()
+def check_signal(symbol, price):
+    """
+    Check if symbol has a signal based on real-time price movement
+    """
+    now = time.time()
 
-    with lock:
-        prices_list = list(price_history[symbol])
-        meta = symbol_metadata.get(symbol, {}).copy()
-
-    if len(prices_list) < 5:
+    # Cooldown check
+    if symbol in alerted and now - alerted[symbol] < ALERT_COOLDOWN_SEC:
         return
 
-    funding = meta.get("funding", 0.0)
-    change_24h = meta.get("price24hPcnt", 0.0)
-    turnover24h = meta.get("turnover24h", 0.0)
+    with lock:
+        prices = price_history[symbol]
 
-    # FAST changes
-    change_1m = calc_change(prices_list, 60)
-    change_3m = calc_change(prices_list, 180)
-    change_5m = calc_change(prices_list, 300)
+        # Need some history (kept as your original)
+        if len(prices) < 30:
+            return
 
+        # Get metadata
+        meta = symbol_metadata.get(symbol, {})
+        oi = meta.get("oi", 0)
+        funding = meta.get("funding", 0)
+        volume24h = meta.get("volume24h", 0)
+
+    # Filter by OI
+    if oi < MIN_OI or oi > MAX_OI:
+        return
+
+    # Calculate changes
+    change_1m = calc_change(prices, 60)
+    change_3m = calc_change(prices, 180)
+    change_5m = calc_change(prices, 300)
+
+    # Detect signals
     signals = []
     score = 0
 
-    # FAST LONG
-    if change_1m >= MOVE_EXPLOSIVE_1M:
-        signals.append(f"💣💣💣 +{round(change_1m,1)}% בדקה (PUMP)")
-        score += 8
-    elif change_1m >= MOVE_1M:
-        signals.append(f"🚀 +{round(change_1m,1)}% בדקה")
+    # LONG signals
+    if change_1m >= MOVE_EXPLOSIVE:
+        signals.append(f"💣💣💣 +{round(change_1m, 1)}% תוך דקה - PUMP!")
+        score += 7
+    elif change_1m >= MOVE_1MIN_STRONG:
+        signals.append(f"🚀 +{round(change_1m, 1)}% תוך דקה!")
         score += 4
 
-    if change_3m >= MOVE_3M:
-        signals.append(f"📈 +{round(change_3m,1)}% ב-3 דקות")
+    if change_3m >= MOVE_3MIN_STRONG:
+        signals.append(f"📈 +{round(change_3m, 1)}% ב-3 דקות")
         score += 3
-    if change_5m >= MOVE_5M:
-        signals.append(f"⚡ +{round(change_5m,1)}% ב-5 דקות")
+
+    if change_5m >= MOVE_5MIN_STRONG:
+        signals.append(f"⚡ +{round(change_5m, 1)}% ב-5 דקות")
         score += 2
 
-    # FAST SHORT
-    if change_1m <= -MOVE_EXPLOSIVE_1M:
-        signals.append(f"💣💣💣 {round(change_1m,1)}% בדקה (DUMP)")
-        score += 8
-    elif change_1m <= -MOVE_1M:
-        signals.append(f"💥 {round(change_1m,1)}% בדקה")
+    # SHORT signals
+    if change_1m <= -MOVE_EXPLOSIVE:
+        signals.append(f"💣💣💣 {round(change_1m, 1)}% תוך דקה - DUMP!")
+        score += 7
+    elif change_1m <= -MOVE_1MIN_STRONG:
+        signals.append(f"💥 {round(change_1m, 1)}% תוך דקה!")
         score += 4
 
-    if change_3m <= -MOVE_3M:
-        signals.append(f"📉 {round(change_3m,1)}% ב-3 דקות")
+    if change_3m <= -MOVE_3MIN_STRONG:
+        signals.append(f"📉 {round(change_3m, 1)}% ב-3 דקות")
         score += 3
-    if change_5m <= -MOVE_5M:
-        signals.append(f"⚡ {round(change_5m,1)}% ב-5 דקות")
+
+    if change_5m <= -MOVE_5MIN_STRONG:
+        signals.append(f"⚡ {round(change_5m, 1)}% ב-5 דקות")
         score += 2
 
-    # Acceleration
+    # Momentum acceleration
     if abs(change_1m) > abs(change_3m) * 0.7 and abs(change_1m) >= 2.0:
         signals.append("⚡ התנעה מואצת")
         score += 2
 
-    # Funding boost
-    if abs(funding) >= FUNDING_ABS_FOR_BOOST and score >= 4:
-        signals.append(f"💹 Funding חריג: {round(funding,4)}%")
-        score += 2
+    # ✅ Funding squeeze logic (kept, but thresholds are ±0.5%)
+    if funding <= FUNDING_EXTREME_NEGATIVE and change_1m > 0:
+        signals.append(f"💣 Funding קיצוני: {round(funding, 2)}% - SHORT SQUEEZE אפשרי!")
+        score += 5
+    elif funding >= FUNDING_EXTREME_POSITIVE and change_1m < 0:
+        signals.append(f"💣 Funding קיצוני: +{round(funding, 2)}% - LONG SQUEEZE אפשרי!")
+        score += 5
 
-    # Update anchors for slow signals
-    update_anchors(symbol, ts, price)
-    with lock:
-        a2 = anchors.get(symbol, {}).copy()
-
-    t15 = a2.get("t15")
-    t60 = a2.get("t60")
-    change_15m = pct_change(t15[1], price) if t15 else 0.0
-    change_1h = pct_change(t60[1], price) if t60 else 0.0
-
-    # ✅ added: trend label (used in both fast & slow messages)
-    trend = trend_label(change_15m, change_1h, change_24h)
-
-    # OI gate
-    if not pass_oi_gate(symbol, score, change_24h):
+    # Need strong signal
+    if score < 4:
         return
 
-    # Turnover filter (400K)
-    is_explosive = (abs(change_1m) >= MOVE_EXPLOSIVE_1M)
-    min_turnover = MIN_TURNOVER_24H_EXPLOSIVE if is_explosive else MIN_TURNOVER_24H_NORMAL
-    if turnover24h < min_turnover:
+    # Determine direction
+    is_long = change_1m > 0 and change_3m > 0
+    is_short = change_1m < 0 and change_3m < 0
+
+    if not (is_long or is_short):
         return
 
-    # Funding extreme alert (with 1h cooldown)
-    if funding <= FUNDING_EXTREME_NEG or funding >= FUNDING_EXTREME_POS:
-        key = symbol + "_extreme"
-        with lock:
-            last = last_alert_funding.get(key)
-        if (last is None) or (ts - last >= ALERT_COOLDOWN_FUNDING_SEC):
-            send_funding_extreme_alert(symbol, funding, price)
-            with lock:
-                last_alert_funding[key] = ts
+    direction = "🟢 LONG" if is_long else "🔴 SHORT"
 
-    # Liquidity checks only when score >= 4
-    if score >= 4:
-        obc = get_orderbook_cached(symbol)
-        if obc.get("ok") and obc.get("payload"):
-            spread_pct = obc.get("spread_pct", 0.0)
-            payload = obc["payload"]
+    # Strength
+    if score >= 8:
+        strength = "🔥🔥🔥🔥 קריטי!"
+    elif score >= 6:
+        strength = "🔥🔥🔥 חזק מאוד"
+    else:
+        strength = "🔥🔥 חזק"
 
-            max_spread = MAX_SPREAD_EXPLOSIVE_PCT if is_explosive else MAX_SPREAD_NORMAL_PCT
-            band = DEPTH_BAND_EXPLOSIVE_PCT if is_explosive else DEPTH_BAND_NORMAL_PCT
-            min_depth = MIN_DEPTH_EXPLOSIVE_USDT if is_explosive else MIN_DEPTH_NORMAL_USDT
+    signals_txt = "\n".join(f"- {s}" for s in signals)
 
-            if spread_pct > max_spread:
-                return
-
-            depth_usdt = calc_depth_within_band(payload, band)
-            if depth_usdt < min_depth:
-                return
-
-        if ENABLE_1M_VOLUME_FILTER:
-            t1m = fetch_1m_turnover_usdt(symbol)
-            if t1m < MIN_1M_TURNOVER_USDT:
-                return
-
-    # FAST alert
-    if score >= 4:
-        is_long = (change_1m > 0 and change_3m > 0)
-        is_short = (change_1m < 0 and change_3m < 0)
-        if is_long or is_short:
-            with lock:
-                last = last_alert_fast.get(symbol)
-            if (last is None) or (ts - last >= ALERT_COOLDOWN_FAST_SEC):
-                send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score, trend)
-                with lock:
-                    last_alert_fast[symbol] = ts
-
-    # SLOW alert
-    slow_trigger = (
-        abs(change_15m) >= MOVE_15M or
-        abs(change_1h) >= MOVE_1H or
-        abs(change_24h) >= MOVE_24H
+    msg = (
+        f"{direction} <b>{symbol}</b>\n"
+        f"{strength}\n\n"
+        f"<b>סיגנלים:</b>\n{signals_txt}\n\n"
+        f"⏱️ 1m: {round(change_1m, 1)}% | 3m: {round(change_3m, 1)}% | 5m: {round(change_5m, 1)}%\n"
+        f"💵 מחיר: ${price}\n"
+        f"💹 Funding: {round(funding, 4)}%\n"
+        f"📊 OI: ${round(oi/1_000_000, 1)}M"
     )
-    if slow_trigger:
-        with lock:
-            last = last_alert_slow.get(symbol)
-        if (last is None) or (ts - last >= ALERT_COOLDOWN_SLOW_SEC):
-            send_slow_alert(symbol, price, change_15m, change_1h, change_24h, trend)
-            with lock:
-                last_alert_slow[symbol] = ts
+
+    send_telegram(msg)
+    alerted[symbol] = now
+    print(f"🎯 ALERT: {symbol} {direction} | 1m={round(change_1m,1)}% | score={score}", flush=True)
 
 # =========================
-# WebSocket subscribe/resubscribe
+# WebSocket
 # =========================
+
+def get_top_symbols():
+    """
+    Get top symbols by turnover24h (filtered by OI)
+    """
+    try:
+        url = "https://api.bybit.com/v5/market/tickers?category=linear"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        tickers = (data.get("result") or {}).get("list", []) or []
+
+        valid_tickers = []
+        for t in tickers:
+            symbol = t.get("symbol", "")
+            oi = safe_float(t.get("openInterestValue", 0))
+            turnover = safe_float(t.get("turnover24h", 0))
+
+            if symbol and (MIN_OI <= oi <= MAX_OI):
+                valid_tickers.append((symbol, turnover))
+
+        valid_tickers.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [s for s, _ in valid_tickers[:TOP_SYMBOLS]]
+
+        print(f"📡 Tracking {len(top_symbols)} symbols (including small caps)", flush=True)
+        return top_symbols
+
+    except Exception as e:
+        print(f"Error getting symbols: {e}", flush=True)
+        return [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+            "ADAUSDT", "DOGEUSDT", "MATICUSDT", "DOTUSDT", "AVAXUSDT"
+        ]
 
 def subscribe_symbols(ws, symbols):
     batch_size = 50
@@ -591,50 +357,45 @@ def subscribe_symbols(ws, symbols):
         batch = symbols[i:i + batch_size]
         topics = [f"tickers.{s}" for s in batch]
         ws.send(json.dumps({"op": "subscribe", "args": topics}))
-        time.sleep(0.25)
+        print(f"📨 Subscribed batch {i//batch_size + 1}: {len(batch)} symbols", flush=True)
+        time.sleep(0.6)  # חשוב כדי לא לקבל rate-limit
 
-def resubscribe_loop():
-    global current_symbols, ws_app
-    while True:
-        try:
-            new_symbols = get_top_symbols()
-            with lock:
-                existing = set(current_symbols)
-            to_add = [s for s in new_symbols if s not in existing]
-            if to_add:
-                with ws_lock:
-                    ws = ws_app
-                if ws:
-                    subscribe_symbols(ws, to_add)
-                    with lock:
-                        current_symbols.extend(to_add)
-        except Exception as e:
-            print(f"Resubscribe loop error: {e}", flush=True)
-        time.sleep(RESUBSCRIBE_EVERY_SEC)
-
-# =========================
-# WebSocket handlers
-# =========================
-
-def on_message(ws, message: str):
+def on_message(ws, message):
     try:
         data = json.loads(message)
-        topic = data.get("topic", "")
+
+        # ✅ subscribe ack/errors (helps debug when only 1 coin works)
+        if "success" in data:
+            if not data.get("success", False):
+                print(f"❌ WS ACK error: {data}", flush=True)
+            return
+
+        if "topic" not in data:
+            return
+
+        topic = data["topic"]
         if not topic.startswith("tickers."):
             return
 
-        ticker_data = data.get("data") or {}
-        symbol = ticker_data.get("symbol") or ""
+        ticker_data = data.get("data", {}) or {}
+        symbol = ticker_data.get("symbol", "")
         last_price = safe_float(ticker_data.get("lastPrice", 0))
 
         if not symbol or last_price <= 0:
             return
 
-        ts = now_ts()
-        with lock:
-            price_history[symbol].append((ts, last_price))
+        now = time.time()
 
-        check_signals(symbol, last_price)
+        # Store price
+        with lock:
+            price_history[symbol].append((now, last_price))
+            funding = (symbol_metadata.get(symbol, {}) or {}).get("funding", 0.0)
+
+        # ✅ Funding alert (independent)
+        maybe_send_funding_alert(symbol, funding, last_price)
+
+        # Check signal
+        check_signal(symbol, last_price)
 
     except Exception as e:
         print(f"Message error: {e}", flush=True)
@@ -643,21 +404,16 @@ def on_error(ws, error):
     print(f"WebSocket error: {error}", flush=True)
 
 def on_close(ws, close_status_code, close_msg):
+    # ✅ do NOT reconnect from here (prevents recursion/duplicated sockets)
     print(f"WebSocket closed ({close_status_code}) {close_msg}", flush=True)
 
 def on_open(ws):
-    global current_symbols
     print("WebSocket connected!", flush=True)
-
     symbols = get_top_symbols()
-    with lock:
-        current_symbols = list(symbols)
-
     subscribe_symbols(ws, symbols)
     print(f"✅ Subscribed initial: {len(symbols)} symbols", flush=True)
 
 def start_websocket():
-    global ws_app
     ws_url = "wss://stream.bybit.com/v5/public/linear"
     ws = websocket.WebSocketApp(
         ws_url,
@@ -666,8 +422,6 @@ def start_websocket():
         on_close=on_close,
         on_open=on_open
     )
-    with ws_lock:
-        ws_app = ws
     ws.run_forever(ping_interval=20, ping_timeout=10)
 
 # =========================
@@ -675,11 +429,11 @@ def start_websocket():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Starting scanner (FAST + SLOW + FUNDING + Anti-Stuck)…", flush=True)
-    print("⏳ Waiting for initial metadata...", flush=True)
-    time.sleep(3)
+    print("🚀 Starting REAL-TIME scanner…", flush=True)
+    print("⚡ WebSocket: תופס תנועות תוך שניות", flush=True)
 
-    threading.Thread(target=resubscribe_loop, daemon=True).start()
+    print("⏳ Waiting for initial data...", flush=True)
+    time.sleep(3)
 
     while True:
         try:
