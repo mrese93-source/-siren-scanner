@@ -24,7 +24,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 def run_server():
-    print("HTTP server on port " + str(PORT), flush=True)
+    print(f"HTTP server on port {PORT}", flush=True)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 threading.Thread(target=run_server, daemon=True).start()
@@ -36,16 +36,15 @@ threading.Thread(target=run_server, daemon=True).start()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Option 3 anti-spam:
+# Option B + Option 3 anti-spam:
 FAST_ANTI_SPAM_SEC = 30 * 60      # 30 דקות
 SLOW_ANTI_SPAM_SEC = 60 * 60      # שעה
 
 FUNDING_ALERT_COOLDOWN_SEC = 60 * 60
 ACCUMULATION_ALERT_COOLDOWN_SEC = 2 * 60 * 60
 
-# Funding change alert (תמיד/משמעותי)
-FUNDING_CHANGE_MIN_DELTA = 0.03   # שינוי מינימלי באחוזים (למשל 0.01 -> 0.04)
-FUNDING_CHANGE_SEND_ON_SIGN_FLIP = True
+# Funding spike ONLY (שקט): שינוי חד של חצי נקודה ומעלה
+FUNDING_SPIKE_MIN_DELTA = 0.50    # 0.50%+
 
 MOVE_EXPLOSIVE_1M = 10.0
 MOVE_1M = 2.5
@@ -100,19 +99,19 @@ oi_history = defaultdict(lambda: deque(maxlen=20))
 funding_history = defaultdict(lambda: deque(maxlen=20))
 volume_history = defaultdict(lambda: deque(maxlen=20))
 
-# Option 3 anti-spam separated:
+# Anti-spam separated:
 last_fast_alert = {}
 last_slow_alert = {}
 
-# Funding/accum state:
+# Funding extreme + accumulation:
 last_alert_funding = {}
 last_accum_alert = {}
 anchors = {}
 orderbook_cache = {}
 
-# Funding change state:
-last_price_cache = {}     # store last price per symbol (for alert message)
-last_funding_seen = {}    # store last funding per symbol
+# Funding spike state:
+last_price_cache = {}     # last price per symbol
+last_funding_seen = {}    # last funding per symbol
 
 ws_app = None
 ws_lock = threading.Lock()
@@ -250,126 +249,21 @@ def fetch_1m_turnover_usdt(symbol):
         return 0.0
 
 # =========================
-# Funding change alerts
+# Alerts
 # =========================
 
-def send_funding_change_alert(symbol, prev_f, new_f, price):
-    direction = "🟢 Bias LONG" if new_f < 0 else "🔴 Bias SHORT"
-    state = "Short pays Long" if new_f < 0 else "Long pays Short"
+def send_funding_spike_alert(symbol, prev_f, new_f, price):
     delta = new_f - prev_f
     arrow = "⬆️" if delta > 0 else "⬇️"
-
     msg = (
-        "📉 <b>Funding Change</b>\n"
-        + direction + " <b>" + symbol + "</b>\n\n"
+        "📉 <b>Funding Spike</b>\n"
+        + "<b>" + symbol + "</b>\n\n"
         + "קודם: <b>" + str(round(prev_f, 4)) + "%</b>\n"
         + "עכשיו: <b>" + str(round(new_f, 4)) + "%</b>\n"
         + "שינוי: <b>" + arrow + " " + str(round(delta, 4)) + "%</b>\n"
-        + "מצב: " + state + "\n"
         + ("💵 מחיר: $" + str(price) + "\n" if price and price > 0 else "")
     )
     send_telegram(msg)
-
-# =========================
-# Metadata updater
-# =========================
-
-def update_metadata():
-    while True:
-        try:
-            r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10)
-            data = r.json().get("result", {}).get("list", [])
-            ts = now_ts()
-            local = {}
-
-            for t in data:
-                symbol = t.get("symbol")
-                if not symbol:
-                    continue
-
-                oi = safe_float(t.get("openInterestValue", 0))
-                funding = safe_float(t.get("fundingRate", 0)) * 100.0
-                volume = safe_float(t.get("turnover24h", 0))
-
-                # Funding change detection (אופציה 3: שולח כשיש שינוי משמעותי/היפוך סימן)
-                prev_f = last_funding_seen.get(symbol)
-                last_funding_seen[symbol] = funding
-                if prev_f is not None:
-                    sign_flip = ((prev_f > 0) != (funding > 0)) if (prev_f != 0 and funding != 0) else False
-                    big_change = abs(funding - prev_f) >= FUNDING_CHANGE_MIN_DELTA
-                    if big_change or (FUNDING_CHANGE_SEND_ON_SIGN_FLIP and sign_flip):
-                        price = last_price_cache.get(symbol, 0.0)
-                        send_funding_change_alert(symbol, prev_f, funding, price)
-
-                local[symbol] = {
-                    "oi": oi,
-                    "turnover24h": volume,
-                    "funding": funding,
-                    "volume24h": safe_float(t.get("volume24h", 0)),
-                    "price24hPcnt": safe_float(t.get("price24hPcnt", 0)) * 100.0,
-                    "last_update": ts,
-                }
-
-                # היסטוריה לצבירה שקטה
-                oi_history[symbol].append(oi)
-                funding_history[symbol].append(funding)
-                volume_history[symbol].append(volume)
-
-            with lock:
-                symbol_metadata.update(local)
-
-            print("Updated metadata for " + str(len(local)) + " symbols", flush=True)
-        except Exception as e:
-            print("Metadata error: " + str(e), flush=True)
-
-        time.sleep(30)
-
-threading.Thread(target=update_metadata, daemon=True).start()
-
-# =========================
-# Symbols
-# =========================
-
-def get_top_symbols():
-    try:
-        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10)
-        tickers = r.json().get("result", {}).get("list", []) or []
-        valid = []
-
-        for t in tickers:
-            symbol = t.get("symbol") or ""
-            if not symbol:
-                continue
-            turnover = safe_float(t.get("turnover24h", 0))
-            oi = safe_float(t.get("openInterestValue", 0))
-            if turnover <= 0 or oi > MAX_OI:
-                continue
-            valid.append((symbol, turnover + oi * 0.01))
-
-        valid.sort(key=lambda x: x[1], reverse=True)
-        symbols = [s for s, _ in valid[:TOP_N_SYMBOLS]]
-        print("Tracking " + str(len(symbols)) + " symbols", flush=True)
-        return symbols
-    except Exception as e:
-        print("Error getting symbols: " + str(e), flush=True)
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-def pass_oi_gate(symbol, fast_score, change_24h):
-    with lock:
-        meta = symbol_metadata.get(symbol, {})
-        oi = meta.get("oi", 0)
-
-    if MIN_OI_SOFT <= oi <= MAX_OI:
-        return True
-    if abs(change_24h) >= MOVE_24H:
-        return True
-    if ALLOW_LOW_OI_IF_STRONG_MOVE and fast_score >= LOW_OI_FAST_SCORE_BYPASS:
-        return True
-    return False
-
-# =========================
-# Alerts
-# =========================
 
 def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score):
     with lock:
@@ -466,6 +360,103 @@ def send_funding_extreme_alert(symbol, funding, price):
     send_telegram(msg)
 
 # =========================
+# Metadata updater
+# =========================
+
+def update_metadata():
+    while True:
+        try:
+            r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10)
+            data = r.json().get("result", {}).get("list", [])
+            ts = now_ts()
+            local = {}
+
+            for t in data:
+                symbol = t.get("symbol")
+                if not symbol:
+                    continue
+
+                oi = safe_float(t.get("openInterestValue", 0))
+                funding = safe_float(t.get("fundingRate", 0)) * 100.0
+                turnover = safe_float(t.get("turnover24h", 0))
+
+                # Funding spike: רק אם שינוי חד 0.50%+
+                prev_f = last_funding_seen.get(symbol)
+                last_funding_seen[symbol] = funding
+                if prev_f is not None:
+                    delta = funding - prev_f
+                    if abs(delta) >= FUNDING_SPIKE_MIN_DELTA:
+                        with lock:
+                            price = last_price_cache.get(symbol, 0.0)
+                        send_funding_spike_alert(symbol, prev_f, funding, price)
+
+                local[symbol] = {
+                    "oi": oi,
+                    "turnover24h": turnover,
+                    "funding": funding,
+                    "volume24h": safe_float(t.get("volume24h", 0)),
+                    "price24hPcnt": safe_float(t.get("price24hPcnt", 0)) * 100.0,
+                    "last_update": ts,
+                }
+
+                # היסטוריה לצבירה שקטה
+                oi_history[symbol].append(oi)
+                funding_history[symbol].append(funding)
+                volume_history[symbol].append(turnover)
+
+            with lock:
+                symbol_metadata.update(local)
+
+            print("Updated metadata for " + str(len(local)) + " symbols", flush=True)
+        except Exception as e:
+            print("Metadata error: " + str(e), flush=True)
+
+        time.sleep(30)
+
+threading.Thread(target=update_metadata, daemon=True).start()
+
+# =========================
+# Symbols
+# =========================
+
+def get_top_symbols():
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10)
+        tickers = r.json().get("result", {}).get("list", []) or []
+        valid = []
+
+        for t in tickers:
+            symbol = t.get("symbol") or ""
+            if not symbol:
+                continue
+            turnover = safe_float(t.get("turnover24h", 0))
+            oi = safe_float(t.get("openInterestValue", 0))
+            if turnover <= 0 or oi > MAX_OI:
+                continue
+            valid.append((symbol, turnover + oi * 0.01))
+
+        valid.sort(key=lambda x: x[1], reverse=True)
+        symbols = [s for s, _ in valid[:TOP_N_SYMBOLS]]
+        print("Tracking " + str(len(symbols)) + " symbols", flush=True)
+        return symbols
+    except Exception as e:
+        print("Error getting symbols: " + str(e), flush=True)
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+def pass_oi_gate(symbol, fast_score, change_24h):
+    with lock:
+        meta = symbol_metadata.get(symbol, {})
+        oi = meta.get("oi", 0)
+
+    if MIN_OI_SOFT <= oi <= MAX_OI:
+        return True
+    if abs(change_24h) >= MOVE_24H:
+        return True
+    if ALLOW_LOW_OI_IF_STRONG_MOVE and fast_score >= LOW_OI_FAST_SCORE_BYPASS:
+        return True
+    return False
+
+# =========================
 # Accumulation checker
 # =========================
 
@@ -485,8 +476,8 @@ def check_accumulation(symbol, price):
     if len(oi_hist) < ACCUM_HISTORY_MIN:
         return
 
-    # מחיר יציב?
-    price_change = abs(calc_change(prices_list, 180))  # 3 דקות
+    # מחיר יציב? (3 דקות)
+    price_change = abs(calc_change(prices_list, 180))
     if price_change > PRICE_STABLE_MAX_PCT:
         return
 
@@ -764,7 +755,7 @@ def start_websocket():
 # =========================
 
 if __name__ == "__main__":
-    print("Starting scanner (FAST + SLOW + ACCUMULATION + FUNDING + FUNDING CHANGE)…", flush=True)
+    print("Starting scanner (FAST + SLOW + ACCUMULATION + FUNDING EXTREME + FUNDING SPIKE)…", flush=True)
     time.sleep(3)
     threading.Thread(target=resubscribe_loop, daemon=True).start()
 
