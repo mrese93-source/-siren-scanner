@@ -53,10 +53,10 @@ MOVE_1H = 15.0
 MOVE_24H = 30.0
 
 # Funding extreme thresholds (in %)
-# ✅ Changed to 0.5% to catch earlier, as you requested
+# ✅ Early detection (as requested)
 FUNDING_EXTREME_POS = 0.5     # +0.5% and above
 FUNDING_EXTREME_NEG = -0.5    # -0.5% and below
-FUNDING_ABS_FOR_BOOST = 0.5   # keep as-is: boosts score if move signal exists
+FUNDING_ABS_FOR_BOOST = 0.5   # boosts score if move signal exists
 
 # Tracking size and refresh
 TOP_N_SYMBOLS = 500
@@ -70,16 +70,16 @@ MAX_OI = 800_000_000
 ALLOW_LOW_OI_IF_STRONG_MOVE = True
 LOW_OI_FAST_SCORE_BYPASS = 7
 
-# -------- Anti-stuck (liquidity) - dynamic (you said: don't miss, but don't get stuck) --------
-MIN_TURNOVER_24H_NORMAL = 1_000_000     # normal signal needs >= 1M USDT 24h turnover
-MIN_TURNOVER_24H_EXPLOSIVE = 250_000    # explosive allows >= 250K USDT 24h turnover
+# -------- Anti-stuck (liquidity) - dynamic (tuned for "don't miss") --------
+MIN_TURNOVER_24H_NORMAL = 700_000      # was 1,000,000
+MIN_TURNOVER_24H_EXPLOSIVE = 150_000   # was 250,000
 
 # --- Advanced anti-stuck liquidity filters (only checked when score >= 4) ---
 ORDERBOOK_TTL_SEC = 25  # cache orderbook per symbol
 
 # Spread thresholds (%)
-MAX_SPREAD_NORMAL_PCT = 0.35
-MAX_SPREAD_EXPLOSIVE_PCT = 0.60
+MAX_SPREAD_NORMAL_PCT = 0.45           # was 0.35
+MAX_SPREAD_EXPLOSIVE_PCT = 0.80        # was 0.60
 
 # Depth within band around mid (%)
 DEPTH_BAND_NORMAL_PCT = 0.50
@@ -90,7 +90,7 @@ MIN_DEPTH_EXPLOSIVE_USDT = 8_000
 
 # Optional: last 1m candle turnover filter
 ENABLE_1M_VOLUME_FILTER = True
-MIN_1M_TURNOVER_USDT = 3_000
+MIN_1M_TURNOVER_USDT = 1200            # was 3000
 
 # =========================
 # State
