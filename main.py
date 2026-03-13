@@ -3,16 +3,16 @@ import time
 import json
 import threading
 from collections import deque, defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 import websocket
 
 # =========================
-# Railway / Render keep-alive
+# Config
 # =========================
 
-PORT = int(os.environ.get("PORT", "8080"))
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
 HEADERS = {
     "User-Agent": (
@@ -21,31 +21,6 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
-
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format, *args):
-        return
-
-
-def run_server():
-    print(f"HTTP server on port {PORT}", flush=True)
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
-
-
-threading.Thread(target=run_server, daemon=True).start()
-
-# =========================
-# Config
-# =========================
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
 
 FAST_ANTI_SPAM_SEC = 30 * 60
 SLOW_ANTI_SPAM_SEC = 60 * 60
@@ -97,6 +72,8 @@ PRICE_STABLE_MAX_PCT = 1.2
 FUNDING_TREND_MIN = 0.01
 ACCUM_HISTORY_MIN = 4
 
+HTTP_TIMEOUT = 10
+
 # =========================
 # State
 # =========================
@@ -124,6 +101,9 @@ ws_app = None
 ws_lock = threading.Lock()
 current_symbols = []
 
+session = requests.Session()
+session.headers.update(HEADERS)
+
 # =========================
 # Utils
 # =========================
@@ -146,6 +126,26 @@ def pct_change(old, new):
     return ((new - old) / old) * 100.0
 
 
+def http_get_json(url, timeout=HTTP_TIMEOUT):
+    try:
+        r = session.get(url, timeout=timeout)
+        r.raise_for_status()
+
+        if not r.text or not r.text.strip():
+            return None
+
+        return r.json()
+    except requests.RequestException as e:
+        print(f"HTTP error: {e} | {url}", flush=True)
+        return None
+    except ValueError as e:
+        print(f"JSON decode error: {e} | {url}", flush=True)
+        return None
+    except Exception as e:
+        print(f"Unexpected GET error: {e} | {url}", flush=True)
+        return None
+
+
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Missing TELEGRAM_TOKEN or CHAT_ID", flush=True)
@@ -153,7 +153,7 @@ def send_telegram(msg: str):
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(
+        r = session.post(
             url,
             data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=10,
@@ -161,7 +161,7 @@ def send_telegram(msg: str):
         if r.status_code != 200:
             print(f"Telegram error: {r.status_code} | {r.text}", flush=True)
     except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
+        print(f"Telegram send error: {e}", flush=True)
 
 
 def calc_change(prices_list, lookback_sec):
@@ -222,10 +222,13 @@ def update_anchors(symbol, ts, price):
 
 
 def fetch_orderbook_metrics(symbol):
+    url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=50"
+    data = http_get_json(url, timeout=6)
+    if not data:
+        return False, 0.0, None
+
     try:
-        url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=50"
-        r = requests.get(url, timeout=6, headers=HEADERS)
-        ob = r.json().get("result", {}) or {}
+        ob = data.get("result", {}) or {}
         bids = ob.get("b", []) or []
         asks = ob.get("a", []) or []
 
@@ -242,7 +245,8 @@ def fetch_orderbook_metrics(symbol):
         spread_pct = ((best_ask - best_bid) / mid) * 100.0
 
         return True, spread_pct, {"mid": mid, "bids": bids, "asks": asks}
-    except Exception:
+    except Exception as e:
+        print(f"Orderbook parse error for {symbol}: {e}", flush=True)
         return False, 0.0, None
 
 
@@ -281,10 +285,13 @@ def get_orderbook_cached(symbol):
 
 
 def fetch_1m_turnover_usdt(symbol):
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit=1"
+    data = http_get_json(url, timeout=6)
+    if not data:
+        return 0.0
+
     try:
-        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit=1"
-        r = requests.get(url, timeout=6, headers=HEADERS)
-        lst = r.json().get("result", {}).get("list", []) or []
+        lst = data.get("result", {}).get("list", []) or []
         if lst and len(lst[0]) > 6:
             return safe_float(lst[0][6])
         return 0.0
@@ -422,16 +429,21 @@ def send_funding_extreme_alert(symbol, funding, price):
 def update_metadata():
     while True:
         try:
-            r = requests.get(
+            data = http_get_json(
                 "https://api.bybit.com/v5/market/tickers?category=linear",
                 timeout=10,
-                headers=HEADERS,
             )
-            data = r.json().get("result", {}).get("list", [])
+
+            if not data:
+                print("Metadata fetch returned empty/invalid response", flush=True)
+                time.sleep(30)
+                continue
+
+            tickers = data.get("result", {}).get("list", [])
             ts = now_ts()
             local = {}
 
-            for t in data:
+            for t in tickers:
                 symbol = t.get("symbol")
                 if not symbol:
                     continue
@@ -472,25 +484,26 @@ def update_metadata():
             print(f"Updated metadata for {len(local)} symbols", flush=True)
 
         except Exception as e:
-            print(f"Metadata error: {e}", flush=True)
+            print(f"Metadata loop error: {e}", flush=True)
 
         time.sleep(30)
 
-
-threading.Thread(target=update_metadata, daemon=True).start()
 
 # =========================
 # Symbols
 # =========================
 
 def get_top_symbols():
+    data = http_get_json(
+        "https://api.bybit.com/v5/market/tickers?category=linear",
+        timeout=10,
+    )
+    if not data:
+        print("get_top_symbols fallback to defaults", flush=True)
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
     try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/tickers?category=linear",
-            timeout=10,
-            headers=HEADERS,
-        )
-        tickers = r.json().get("result", {}).get("list", []) or []
+        tickers = data.get("result", {}).get("list", []) or []
         valid = []
 
         for t in tickers:
@@ -744,7 +757,10 @@ def subscribe_symbols(ws, symbols):
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i + batch_size]
         topics = ["tickers." + s for s in batch]
-        ws.send(json.dumps({"op": "subscribe", "args": topics}))
+        try:
+            ws.send(json.dumps({"op": "subscribe", "args": topics}))
+        except Exception as e:
+            print(f"Subscribe batch error: {e}", flush=True)
         time.sleep(0.25)
 
 
@@ -767,6 +783,7 @@ def resubscribe_loop():
                     subscribe_symbols(ws, to_add)
                     with lock:
                         current_symbols.extend(to_add)
+                    print(f"Resubscribed {len(to_add)} new symbols", flush=True)
 
         except Exception as e:
             print(f"Resubscribe error: {e}", flush=True)
@@ -829,16 +846,20 @@ def start_websocket():
     ws_url = "wss://stream.bybit.com/v5/public/linear"
     ws = websocket.WebSocketApp(
         ws_url,
+        on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
-        on_open=on_open,
     )
 
     with ws_lock:
         ws_app = ws
 
-    ws.run_forever(ping_interval=20, ping_timeout=10)
+    ws.run_forever(
+        ping_interval=20,
+        ping_timeout=10,
+        reconnect=5,
+    )
 
 
 # =========================
@@ -846,11 +867,9 @@ def start_websocket():
 # =========================
 
 if __name__ == "__main__":
-    print(
-        "Starting scanner (FAST + SLOW + ACCUMULATION + FUNDING EXTREME + FUNDING SPIKE)...",
-        flush=True,
-    )
-    time.sleep(3)
+    print("Starting scanner worker...", flush=True)
+
+    threading.Thread(target=update_metadata, daemon=True).start()
     threading.Thread(target=resubscribe_loop, daemon=True).start()
 
     while True:
