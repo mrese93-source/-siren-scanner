@@ -868,7 +868,7 @@ def start_websocket():
 # =========================
 
 if __name__ == "__main__":
-    print("Starting scanner worker...", flush=True)
+    print("MOHAMED NEW VERSION LIVE", flush=True)
 
     threading.Thread(target=update_metadata, daemon=True).start()
     threading.Thread(target=resubscribe_loop, daemon=True).start()
