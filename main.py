@@ -582,13 +582,12 @@ def check_accumulation(symbol, price):
 
     if vol_spike < VOLUME_SPIKE_MIN and abs(funding_trend) < FUNDING_TREND_MIN:
         return
-
-    if funding <= -0.05 or funding_trend < 0:
-        direction = "long"
-    elif funding >= 0.05 or funding_trend > 0:
-        direction = "short"
-    else:
-        return
+if funding <= -0.05 or funding_trend < 0:
+    direction = "long"
+elif funding >= 0.05 or funding_trend > 0:
+    direction = "short"
+else:
+    return
 
     send_accumulation_alert(symbol, price, direction, oi_trend, funding_trend, vol_spike, funding)
 
