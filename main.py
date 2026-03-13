@@ -66,9 +66,9 @@ MIN_DEPTH_EXPLOSIVE_USDT = 8_000
 ENABLE_1M_VOLUME_FILTER = True
 MIN_1M_TURNOVER_USDT = 800
 
-OI_TREND_MIN_PCT = 1.5
-VOLUME_SPIKE_MIN = 1.8
-PRICE_STABLE_MAX_PCT = 1.2
+OI_TREND_MIN_PCT = 3.5
+VOLUME_SPIKE_MIN = 2.2
+PRICE_STABLE_MAX_PCT = 0.9
 FUNDING_TREND_MIN = 0.01
 ACCUM_HISTORY_MIN = 4
 
@@ -583,9 +583,9 @@ def check_accumulation(symbol, price):
     if vol_spike < VOLUME_SPIKE_MIN and abs(funding_trend) < FUNDING_TREND_MIN:
         return
 
-    if funding >= 0.05 or funding_trend > 0:
+    if funding <= -0.05 or funding_trend < 0:
         direction = "long"
-    elif funding <= -0.05 or funding_trend < 0:
+    elif funding >= 0.05 or funding_trend > 0:
         direction = "short"
     else:
         return
