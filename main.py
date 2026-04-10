@@ -8,1468 +8,282 @@ import requests
 import websocket
 
 # =========================
-
-# Config
-
+# CONFIG
 # =========================
 
-TELEGRAM_TOKEN = os.environ.get(“TELEGRAM_TOKEN”)
-CHAT_ID = os.environ.get(“CHAT_ID”)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
-HEADERS = {
-“User-Agent”: (
-“Mozilla/5.0 (Windows NT 10.0; Win64; x64) “
-“AppleWebKit/537.36 (KHTML, like Gecko) “
-“Chrome/120.0.0.0 Safari/537.36”
-)
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-FAST_ANTI_SPAM_SEC = 30 * 60
-SLOW_ANTI_SPAM_SEC = 60 * 60
-
-FUNDING_ALERT_COOLDOWN_SEC = 60 * 60
-ACCUMULATION_ALERT_COOLDOWN_SEC = 2 * 60 * 60
-FUNDING_SPIKE_ALERT_COOLDOWN_SEC = 60 * 60
-
-FUNDING_SPIKE_MIN_DELTA = 0.50
-
-MOVE_EXPLOSIVE_1M = 10.0
+# thresholds
 MOVE_1M = 2.5
-MOVE_3M = 4.0
 MOVE_5M = 5.0
 MOVE_15M = 8.0
-MOVE_1H = 15.0
-MOVE_24H = 30.0
 
-FUNDING_EXTREME_POS = 0.5
-FUNDING_EXTREME_NEG = -0.5
-FUNDING_ABS_FOR_BOOST = 0.5
+VOLUME_SPIKE = 2.0
+CVD_DIVERGENCE = 4.0
+WHALE_MOVE = 6.0
+ACCUM_STABILITY = 1.2
 
-TOP_N_SYMBOLS = 500
-RESUBSCRIBE_EVERY_SEC = 10 * 60
-
-MIN_OI_SOFT = 50_000
-MAX_OI = 800_000_000
-
-ALLOW_LOW_OI_IF_STRONG_MOVE = True
-LOW_OI_FAST_SCORE_BYPASS = 7
-
-MIN_TURNOVER_24H_NORMAL = 400_000
-MIN_TURNOVER_24H_EXPLOSIVE = 150_000
-
-ORDERBOOK_TTL_SEC = 25
-MAX_SPREAD_NORMAL_PCT = 0.45
-MAX_SPREAD_EXPLOSIVE_PCT = 0.80
-DEPTH_BAND_NORMAL_PCT = 0.50
-DEPTH_BAND_EXPLOSIVE_PCT = 0.80
-MIN_DEPTH_NORMAL_USDT = 20_000
-MIN_DEPTH_EXPLOSIVE_USDT = 8_000
-
-ENABLE_1M_VOLUME_FILTER = True
-MIN_1M_TURNOVER_USDT = 800
-
-OI_TREND_MIN_PCT = 3.5
-VOLUME_SPIKE_MIN = 2.2
-PRICE_STABLE_MAX_PCT = 0.9
-FUNDING_TREND_MIN = 0.01
-ACCUM_HISTORY_MIN = 4
-
-HTTP_TIMEOUT = 10
-
-# ── إضافات جديدة ──────────────────────────────────
-
-LIQ_ZONE_ALERT_COOLDOWN_SEC  = 45 * 60
-LIQ_ZONE_PROXIMITY_PCT       = 1.2
-LIQ_ZONE_WARN_PCT            = 2.5
-LIQ_KLINE_LIMIT              = 96
-LIQ_MIN_TOUCHES              = 2
-LIQ_CLUSTER_BAND_PCT         = 0.3
-
-VP_KLINE_LIMIT   = 96
-VP_BINS          = 40
-VP_HVN_TOP_PCT   = 20
-
-PSYCH_PROXIMITY_PCT = 0.8
-
-WHALE_OI_DROP_PCT       = 3.0
-WHALE_VOL_SPIKE_NO_MOVE = 3.0
-WHALE_PRICE_STABLE_PCT  = 0.6
-WHALE_FUNDING_JUMP      = 0.15
-WHALE_ALERT_COOLDOWN_SEC= 60 * 60
-
-CVD_ALERT_COOLDOWN_SEC  = 45 * 60
-CVD_LOOKBACK_SEC        = 15 * 60
-CVD_DIVERGE_PRICE_MIN   = 1.0
-CVD_DIVERGE_RATIO       = 0.4
-CVD_STRONG_DELTA_X      = 2.5
-
-# ──────────────────────────────────────────────────
+ORDERBOOK_DEPTH_MIN = 15000
+SPREAD_MAX = 0.6
 
 # =========================
-
-# State
-
+# STATE
 # =========================
 
 lock = threading.Lock()
-price_history = defaultdict(lambda: deque(maxlen=2500))
-symbol_metadata = {}
-oi_history = defaultdict(lambda: deque(maxlen=20))
-funding_history = defaultdict(lambda: deque(maxlen=20))
-volume_history = defaultdict(lambda: deque(maxlen=20))
 
-last_fast_alert = {}
-last_slow_alert = {}
-last_alert_funding = {}
-last_accum_alert = {}
-last_funding_spike_alert = {}
+price_history = defaultdict(lambda: deque(maxlen=2000))
+volume_history = defaultdict(lambda: deque(maxlen=200))
 
-# إضافات جديدة
+symbol_meta = {}
+last_price = {}
 
-last_liq_zone_alert = {}
-last_whale_alert    = {}
-last_cvd_alert      = {}
-cvd_history  = defaultdict(lambda: deque(maxlen=500))
-cvd_running  = defaultdict(float)
-liq_zone_cache = {}
-vp_cache       = {}
+cvd = defaultdict(float)
+cvd_hist = defaultdict(lambda: deque(maxlen=200))
 
-anchors = {}
-orderbook_cache = {}
-
-last_price_cache = {}
-last_funding_seen = {}
-
-ws_app = None
-ws_lock = threading.Lock()
-current_symbols = []
+last_alert = defaultdict(float)
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 # =========================
-
-# Utils
-
+# UTILS
 # =========================
 
-def now_ts():
-return time.time()
+def now():
+    return time.time()
 
-def safe_float(x, default=0.0):
-try:
-return float(x)
-except Exception:
-return default
+def f(x):
+    try:
+        return float(x)
+    except:
+        return 0.0
 
-def pct_change(old, new):
-if old <= 0:
-return 0.0
-return ((new - old) / old) * 100.0
+def pct(a, b):
+    if a <= 0:
+        return 0
+    return ((b - a) / a) * 100
 
-def http_get_json(url, timeout=HTTP_TIMEOUT):
-try:
-r = session.get(url, timeout=timeout)
-r.raise_for_status()
+def send(msg):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        session.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except:
+        pass
 
-```
-    if not r.text or not r.text.strip():
+def get_json(url):
+    try:
+        return session.get(url, timeout=8).json()
+    except:
         return None
 
-    return r.json()
-except requests.RequestException as e:
-    print(f"HTTP error: {e} | {url}", flush=True)
-    return None
-except ValueError as e:
-    print(f"JSON decode error: {e} | {url}", flush=True)
-    return None
-except Exception as e:
-    print(f"Unexpected GET error: {e} | {url}", flush=True)
-    return None
-```
-
-def send_telegram(msg: str):
-if not TELEGRAM_TOKEN or not CHAT_ID:
-print(“Missing TELEGRAM_TOKEN or CHAT_ID”, flush=True)
-return
-
-```
-try:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    r = session.post(
-        url,
-        data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-        timeout=10,
-    )
-    if r.status_code != 200:
-        print(f"Telegram error: {r.status_code} | {r.text}", flush=True)
-except Exception as e:
-    print(f"Telegram send error: {e}", flush=True)
-```
-
-def calc_change(prices_list, lookback_sec):
-if len(prices_list) < 2:
-return 0.0
-
-```
-target_time = now_ts() - lookback_sec
-old_price = None
-
-for ts, p in prices_list:
-    if ts >= target_time:
-        old_price = p
-        break
-
-if old_price is None:
-    return 0.0
-
-return pct_change(old_price, prices_list[-1][1])
-```
-
-def calc_trend(hist_deque):
-items = list(hist_deque)
-if len(items) < ACCUM_HISTORY_MIN:
-return 0.0
-
-```
-changes = []
-for i in range(1, len(items)):
-    if items[i - 1] > 0:
-        changes.append(((items[i] - items[i - 1]) / items[i - 1]) * 100.0)
-
-if not changes:
-    return 0.0
-
-return sum(changes) / len(changes)
-```
-
-def strength_from_score(score):
-if score >= 10:
-return “🔥🔥🔥🔥 קריטי!”
-if score >= 7:
-return “🔥🔥🔥 חזק מאוד”
-return “🔥🔥 חזק”
-
-def update_anchors(symbol, ts, price):
-with lock:
-a = anchors.get(symbol, {})
-
-```
-    t15 = a.get("t15")
-    if (t15 is None) or (ts - t15[0] > 20 * 60):
-        a["t15"] = (ts, price)
-
-    t60 = a.get("t60")
-    if (t60 is None) or (ts - t60[0] > 75 * 60):
-        a["t60"] = (ts, price)
-
-    anchors[symbol] = a
-```
-
-def fetch_orderbook_metrics(symbol):
-url = f”https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=50”
-data = http_get_json(url, timeout=6)
-if not data:
-return False, 0.0, None
-
-```
-try:
-    ob = data.get("result", {}) or {}
-    bids = ob.get("b", []) or []
-    asks = ob.get("a", []) or []
-
-    if not bids or not asks:
-        return False, 0.0, None
-
-    best_bid = safe_float(bids[0][0])
-    best_ask = safe_float(asks[0][0])
-
-    if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
-        return False, 0.0, None
-
-    mid = (best_bid + best_ask) / 2.0
-    spread_pct = ((best_ask - best_bid) / mid) * 100.0
-
-    return True, spread_pct, {"mid": mid, "bids": bids, "asks": asks}
-except Exception as e:
-    print(f"Orderbook parse error for {symbol}: {e}", flush=True)
-    return False, 0.0, None
-```
-
-def calc_depth_within_band(payload, band_pct):
-try:
-mid = payload[“mid”]
-lower = mid * (1.0 - band_pct / 100.0)
-upper = mid * (1.0 + band_pct / 100.0)
-
-```
-    bid_depth = sum(
-        safe_float(px) * safe_float(qty)
-        for px, qty in payload["bids"]
-        if safe_float(px) >= lower
-    )
-    ask_depth = sum(
-        safe_float(px) * safe_float(qty)
-        for px, qty in payload["asks"]
-        if safe_float(px) <= upper
-    )
-    return bid_depth + ask_depth
-except Exception:
-    return 0.0
-```
-
-def get_orderbook_cached(symbol):
-ts = now_ts()
-c = orderbook_cache.get(symbol)
-
-```
-if c and (ts - c["ts"] <= ORDERBOOK_TTL_SEC):
-    return c
-
-ok, spread_pct, payload = fetch_orderbook_metrics(symbol)
-c = {"ts": ts, "ok": ok, "spread_pct": spread_pct, "payload": payload}
-orderbook_cache[symbol] = c
-return c
-```
-
-def fetch_1m_turnover_usdt(symbol):
-url = f”https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit=1”
-data = http_get_json(url, timeout=6)
-if not data:
-return 0.0
-
-```
-try:
-    lst = data.get("result", {}).get("list", []) or []
-    if lst and len(lst[0]) > 6:
-        return safe_float(lst[0][6])
-    return 0.0
-except Exception:
-    return 0.0
-```
-
-def fetch_klines(symbol, interval=“15”, limit=96):
-url = f”https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}”
-data = http_get_json(url, timeout=8)
-if not data:
-return []
-try:
-return data.get(“result”, {}).get(“list”, []) or []
-except Exception:
-return []
-
+# =========================
+# METADATA
 # =========================
 
-# Alerts
+def update_meta():
+    while True:
+        data = get_json("https://api.bybit.com/v5/market/tickers?category=linear")
+        if data:
+            with lock:
+                for t in data.get("result", {}).get("list", []):
+                    s = t.get("symbol")
+                    if not s:
+                        continue
+                    symbol_meta[s] = {
+                        "oi": f(t.get("openInterestValue")),
+                        "funding": f(t.get("fundingRate")) * 100,
+                        "vol": f(t.get("turnover24h")),
+                    }
+        time.sleep(20)
 
 # =========================
-
-def send_funding_spike_alert(symbol, prev_f, new_f, price):
-delta = new_f - prev_f
-arrow = “⬆️” if delta > 0 else “⬇️”
-
-```
-msg = (
-    "📉 <b>Funding Spike</b>\n"
-    f"<b>{symbol}</b>\n\n"
-    f"קודם: <b>{round(prev_f, 4)}%</b>\n"
-    f"עכשיו: <b>{round(new_f, 4)}%</b>\n"
-    f"שינוי: <b>{arrow} {round(delta, 4)}%</b>\n"
-    + (f"💵 מחיר: ${price}\n" if price and price > 0 else "")
-)
-send_telegram(msg)
-```
-
-def send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score):
-with lock:
-meta = symbol_metadata.get(symbol, {})
-oi = meta.get(“oi”, 0)
-funding = meta.get(“funding”, 0)
-
-```
-is_long = change_1m > 0 and change_3m > 0
-direction = "🟢 LONG" if is_long else "🔴 SHORT"
-funding_state = "Short pays Long" if funding < 0 else "Long pays Short"
-
-# أقرب سيولة
-liq_line = ""
-lz = liq_zone_cache.get(symbol)
-if lz:
-    if is_long and lz.get("above"):
-        n = lz["above"][0]
-        d = round(((n["price"] - price) / price) * 100, 2)
-        liq_line = f"\n💧 סיוליות מעל: ${n['price']} (+{d}%)"
-    elif not is_long and lz.get("below"):
-        n = lz["below"][0]
-        d = round(((price - n["price"]) / price) * 100, 2)
-        liq_line = f"\n💧 סיוליות מתחת: ${n['price']} (-{d}%)"
-
-msg = (
-    f"{direction} <b>{symbol}</b>\n"
-    f"{strength_from_score(score)}\n\n"
-    "<b>סיגנלים (מהיר):</b>\n"
-    + "\n".join("- " + s for s in signals)
-    + "\n\n"
-    + f"⏱️ 1m: {round(change_1m, 1)}% | 3m: {round(change_3m, 1)}% | 5m: {round(change_5m, 1)}%\n"
-    + f"💵 מחיר: ${price}\n"
-    + f"📉 Funding: {round(funding, 4)}% ({funding_state})\n"
-    + f"📊 OI: ${round(oi / 1_000_000, 3)}M"
-    + liq_line
-)
-send_telegram(msg)
-```
-
-def send_slow_alert(symbol, price, change_15m, change_1h, change_24h):
-with lock:
-meta = symbol_metadata.get(symbol, {})
-oi = meta.get(“oi”, 0)
-funding = meta.get(“funding”, 0)
-
-```
-direction = "🟢 LONG" if (change_1h > 0 or change_24h > 0) else "🔴 SHORT"
-max_move = max(abs(change_15m), abs(change_1h), abs(change_24h))
-
-if max_move >= 50:
-    strength = "🔥🔥🔥🔥 תנועה חריגה מאוד"
-elif max_move >= 30:
-    strength = "🔥🔥🔥 חזק מאוד"
-else:
-    strength = "🔥🔥 חזק"
-
-signals = []
-if abs(change_15m) >= MOVE_15M:
-    signals.append(f"⏳ 15m: {round(change_15m, 1)}%")
-if abs(change_1h) >= MOVE_1H:
-    signals.append(f"🕐 1h: {round(change_1h, 1)}%")
-if abs(change_24h) >= MOVE_24H:
-    signals.append(f"📅 24h: {round(change_24h, 1)}%")
-
-funding_state = "Short pays Long" if funding < 0 else "Long pays Short"
-
-# أقرب سيولة
-liq_line = ""
-lz = liq_zone_cache.get(symbol)
-if lz:
-    parts = []
-    if lz.get("above"):
-        n = lz["above"][0]
-        d = round(((n["price"] - price) / price) * 100, 2)
-        parts.append(f"⬆️ ${n['price']} (+{d}%)")
-    if lz.get("below"):
-        n = lz["below"][0]
-        d = round(((price - n["price"]) / price) * 100, 2)
-        parts.append(f"⬇️ ${n['price']} (-{d}%)")
-    if parts:
-        liq_line = "\n💧 סיוליות: " + " | ".join(parts)
-
-msg = (
-    f"{direction} <b>{symbol}</b>\n"
-    f"{strength}\n\n"
-    "<b>סיגנלים (איטי):</b>\n"
-    + ("\n".join("- " + s for s in signals) if signals else "- תנועה משמעותית")
-    + "\n\n"
-    + f"💵 מחיר: ${price}\n"
-    + f"📉 Funding: {round(funding, 4)}% ({funding_state})\n"
-    + f"📊 OI: ${round(oi / 1_000_000, 3)}M"
-    + liq_line
-)
-send_telegram(msg)
-```
-
-def send_accumulation_alert(symbol, price, direction, oi_trend, funding_trend, vol_spike, funding):
-funding_state = “Short pays Long” if funding < 0 else “Long pays Short”
-dir_txt = “🟢 LONG מוקדם” if direction == “long” else “🔴 SHORT מוקדם”
-
-```
-signals = [
-    f"🔍 OI עולה בעקביות: {round(oi_trend, 2)}% ממוצע",
-    "🧘 מחיר יציב - צבירה לפני מהלך",
-]
-
-if vol_spike >= VOLUME_SPIKE_MIN:
-    signals.insert(1, f"📦 Volume קפץ: x{round(vol_spike, 1)} מהרגיל")
-
-if abs(funding_trend) >= FUNDING_TREND_MIN:
-    signals.insert(1, f"📉 Funding מתחיל לזוז: {round(funding_trend, 4)}%")
-
-# أقرب سيولة
-lz_lines = ""
-lz = liq_zone_cache.get(symbol)
-if lz:
-    parts = []
-    if lz.get("above"):
-        n = lz["above"][0]
-        d = round(((n["price"] - price) / price) * 100, 2)
-        parts.append(f"⬆️ ${n['price']} (+{d}%) {n['strength']}")
-    if lz.get("below"):
-        n = lz["below"][0]
-        d = round(((price - n["price"]) / price) * 100, 2)
-        parts.append(f"⬇️ ${n['price']} (-{d}%) {n['strength']}")
-    if parts:
-        lz_lines = "\n\n💧 <b>מناطق סיוליות:</b>\n" + "\n".join(parts)
-
-msg = (
-    f"{dir_txt} <b>{symbol}</b>\n"
-    "💡 זיהוי מוקדם - לפני שהמחיר זז\n\n"
-    "<b>סיגנלים:</b>\n"
-    + "\n".join("- " + s for s in signals)
-    + "\n\n"
-    + f"💵 מחיר: ${price}\n"
-    + f"📉 Funding: {round(funding, 4)}% ({funding_state})"
-    + lz_lines
-)
-send_telegram(msg)
-```
-
-def send_funding_extreme_alert(symbol, funding, price):
-direction = “🟢 Bias LONG” if funding < 0 else “🔴 Bias SHORT”
-state = “Short pays Long” if funding < 0 else “Long pays Short”
-
-```
-msg = (
-    f"{direction} <b>{symbol}</b>\n"
-    "⚠️ <b>Funding חריג</b>\n\n"
-    f"📉 Funding: <b>{round(funding, 4)}%</b>\n"
-    f"🧾 מצב: {state}\n"
-    f"💵 מחיר: ${price}\n"
-)
-send_telegram(msg)
-```
-
+# ORDERBOOK (LIGHT)
 # =========================
 
-# Metadata updater
+def orderbook(symbol):
+    url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=25"
+    d = get_json(url)
+    if not d:
+        return None
+
+    try:
+        ob = d["result"]
+        bids = ob["b"]
+        asks = ob["a"]
+
+        best_bid = f(bids[0][0])
+        best_ask = f(asks[0][0])
+
+        mid = (best_bid + best_ask) / 2
+        spread = ((best_ask - best_bid) / mid) * 100
+
+        depth = sum(f(b[1]) for b in bids[:10]) + sum(f(a[1]) for a in asks[:10])
+
+        return {
+            "spread": spread,
+            "depth": depth
+        }
+    except:
+        return None
 
 # =========================
-
-def update_metadata():
-while True:
-try:
-data = http_get_json(
-“https://api.bybit.com/v5/market/tickers?category=linear”,
-timeout=10,
-)
-
-```
-        if not data:
-            print("Metadata fetch returned empty/invalid response", flush=True)
-            time.sleep(30)
-            continue
-
-        tickers = data.get("result", {}).get("list", [])
-        ts = now_ts()
-        local = {}
-
-        for t in tickers:
-            symbol = t.get("symbol")
-            if not symbol:
-                continue
-
-            oi = safe_float(t.get("openInterestValue", 0))
-            funding = safe_float(t.get("fundingRate", 0)) * 100.0
-            turnover = safe_float(t.get("turnover24h", 0))
-
-            prev_f = last_funding_seen.get(symbol)
-            last_funding_seen[symbol] = funding
-
-            if prev_f is not None:
-                delta = funding - prev_f
-                last_spike = last_funding_spike_alert.get(symbol, 0)
-
-                if abs(delta) >= FUNDING_SPIKE_MIN_DELTA and (ts - last_spike >= FUNDING_SPIKE_ALERT_COOLDOWN_SEC):
-                    with lock:
-                        price = last_price_cache.get(symbol, 0.0)
-                    send_funding_spike_alert(symbol, prev_f, funding, price)
-                    last_funding_spike_alert[symbol] = ts
-
-            local[symbol] = {
-                "oi": oi,
-                "turnover24h": turnover,
-                "funding": funding,
-                "volume24h": safe_float(t.get("volume24h", 0)),
-                "price24hPcnt": safe_float(t.get("price24hPcnt", 0)) * 100.0,
-                "last_update": ts,
-            }
-
-            oi_history[symbol].append(oi)
-            funding_history[symbol].append(funding)
-            volume_history[symbol].append(turnover)
-
-        with lock:
-            symbol_metadata.update(local)
-
-        print(f"Updated metadata for {len(local)} symbols", flush=True)
-
-    except Exception as e:
-        print(f"Metadata loop error: {e}", flush=True)
-
-    time.sleep(30)
-```
-
+# CORE ENGINE
 # =========================
 
-# Symbols
+def engine(symbol, price):
+    with lock:
+        hist = price_history[symbol]
+        meta = symbol_meta.get(symbol, {})
+        prev = last_price.get(symbol, 0)
 
-# =========================
-
-def get_top_symbols():
-data = http_get_json(
-“https://api.bybit.com/v5/market/tickers?category=linear”,
-timeout=10,
-)
-if not data:
-print(“get_top_symbols fallback to defaults”, flush=True)
-return [“BTCUSDT”, “ETHUSDT”, “SOLUSDT”]
-
-```
-try:
-    tickers = data.get("result", {}).get("list", []) or []
-    valid = []
-
-    for t in tickers:
-        symbol = t.get("symbol") or ""
-        if not symbol:
-            continue
-
-        turnover = safe_float(t.get("turnover24h", 0))
-        oi = safe_float(t.get("openInterestValue", 0))
-
-        if turnover <= 0 or oi > MAX_OI:
-            continue
-
-        valid.append((symbol, turnover + oi * 0.01))
-
-    valid.sort(key=lambda x: x[1], reverse=True)
-    symbols = [s for s, _ in valid[:TOP_N_SYMBOLS]]
-    print(f"Tracking {len(symbols)} symbols", flush=True)
-    return symbols
-
-except Exception as e:
-    print(f"Error getting symbols: {e}", flush=True)
-    return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-```
-
-def pass_oi_gate(symbol, fast_score, change_24h):
-with lock:
-meta = symbol_metadata.get(symbol, {})
-oi = meta.get(“oi”, 0)
-
-```
-if MIN_OI_SOFT <= oi <= MAX_OI:
-    return True
-if abs(change_24h) >= MOVE_24H:
-    return True
-if ALLOW_LOW_OI_IF_STRONG_MOVE and fast_score >= LOW_OI_FAST_SCORE_BYPASS:
-    return True
-return False
-```
-
-# =========================
-
-# Accumulation checker
-
-# =========================
-
-def check_accumulation(symbol, price):
-ts = now_ts()
-last = last_accum_alert.get(symbol)
-
-```
-if last and (ts - last) < ACCUMULATION_ALERT_COOLDOWN_SEC:
-    return
-
-with lock:
-    oi_hist = list(oi_history[symbol])
-    fund_hist = list(funding_history[symbol])
-    vol_hist = list(volume_history[symbol])
-    prices_list = list(price_history[symbol])
-    funding = symbol_metadata.get(symbol, {}).get("funding", 0.0)
-
-if len(oi_hist) < ACCUM_HISTORY_MIN:
-    return
-
-price_change = abs(calc_change(prices_list, 180))
-if price_change > PRICE_STABLE_MAX_PCT:
-    return
-
-oi_trend = calc_trend(oi_hist)
-funding_trend = calc_trend(fund_hist)
-
-vol_spike = 1.0
-if len(vol_hist) >= 4:
-    avg = sum(vol_hist[:-1]) / len(vol_hist[:-1])
-    if avg > 0:
-        vol_spike = vol_hist[-1] / avg
-
-if oi_trend < OI_TREND_MIN_PCT:
-    return
-
-if vol_spike < VOLUME_SPIKE_MIN and abs(funding_trend) < FUNDING_TREND_MIN:
-    return
-
-if funding <= -0.05 or funding_trend < 0:
-    direction = "long"
-elif funding >= 0.05 or funding_trend > 0:
-    direction = "short"
-else:
-    return
-
-send_accumulation_alert(symbol, price, direction, oi_trend, funding_trend, vol_spike, funding)
-
-with lock:
-    last_accum_alert[symbol] = ts
-
-print(f"ACCUM ALERT: {symbol} {direction}", flush=True)
-```
-
-# =========================
-
-# Core signal checker
-
-# =========================
-
-def check_signals(symbol, price):
-ts = now_ts()
-
-```
-with lock:
-    last_fast = last_fast_alert.get(symbol)
-    last_slow = last_slow_alert.get(symbol)
-
-fast_blocked = (last_fast is not None) and (ts - last_fast < FAST_ANTI_SPAM_SEC)
-slow_blocked = (last_slow is not None) and (ts - last_slow < SLOW_ANTI_SPAM_SEC)
-
-with lock:
-    prices_list = list(price_history[symbol])
-    meta = symbol_metadata.get(symbol, {}).copy()
-
-if len(prices_list) < 5:
-    return
-
-funding = meta.get("funding", 0.0)
-change_24h = meta.get("price24hPcnt", 0.0)
-turnover24h = meta.get("turnover24h", 0.0)
-
-change_1m = calc_change(prices_list, 60)
-change_3m = calc_change(prices_list, 180)
-change_5m = calc_change(prices_list, 300)
-
-signals = []
-score = 0
-
-if change_1m >= MOVE_EXPLOSIVE_1M:
-    signals.append(f"💣💣💣 +{round(change_1m, 1)}% בדקה (PUMP)")
-    score += 8
-elif change_1m >= MOVE_1M:
-    signals.append(f"🚀 +{round(change_1m, 1)}% בדקה")
-    score += 4
-
-if change_3m >= MOVE_3M:
-    signals.append(f"📈 +{round(change_3m, 1)}% ב-3 דקות")
-    score += 3
-if change_5m >= MOVE_5M:
-    signals.append(f"⚡ +{round(change_5m, 1)}% ב-5 דקות")
-    score += 2
-
-if change_1m <= -MOVE_EXPLOSIVE_1M:
-    signals.append(f"💣💣💣 {round(change_1m, 1)}% בדקה (DUMP)")
-    score += 8
-elif change_1m <= -MOVE_1M:
-    signals.append(f"💥 {round(change_1m, 1)}% בדקה")
-    score += 4
-
-if change_3m <= -MOVE_3M:
-    signals.append(f"📉 {round(change_3m, 1)}% ב-3 דקות")
-    score += 3
-if change_5m <= -MOVE_5M:
-    signals.append(f"⚡ {round(change_5m, 1)}% ב-5 דקות")
-    score += 2
-
-if abs(change_1m) > abs(change_3m) * 0.7 and abs(change_1m) >= 2.0:
-    signals.append("⚡ התנעה מואצת")
-    score += 2
-
-if abs(funding) >= FUNDING_ABS_FOR_BOOST and score >= 4:
-    signals.append(f"📉 Funding חריג: {round(funding, 4)}%")
-    score += 2
-
-update_anchors(symbol, ts, price)
-
-with lock:
-    a2 = anchors.get(symbol, {}).copy()
-
-t15 = a2.get("t15")
-t60 = a2.get("t60")
-change_15m = pct_change(t15[1], price) if t15 else 0.0
-change_1h = pct_change(t60[1], price) if t60 else 0.0
-
-if not pass_oi_gate(symbol, score, change_24h):
-    return
-
-is_explosive = abs(change_1m) >= MOVE_EXPLOSIVE_1M
-min_turnover = MIN_TURNOVER_24H_EXPLOSIVE if is_explosive else MIN_TURNOVER_24H_NORMAL
-if turnover24h < min_turnover:
-    return
-
-if score >= 4:
-    obc = get_orderbook_cached(symbol)
-    if obc.get("ok") and obc.get("payload"):
-        spread_pct = obc.get("spread_pct", 0.0)
-        payload = obc["payload"]
-
-        max_spread = MAX_SPREAD_EXPLOSIVE_PCT if is_explosive else MAX_SPREAD_NORMAL_PCT
-        band = DEPTH_BAND_EXPLOSIVE_PCT if is_explosive else DEPTH_BAND_NORMAL_PCT
-        min_depth = MIN_DEPTH_EXPLOSIVE_USDT if is_explosive else MIN_DEPTH_NORMAL_USDT
-
-        if spread_pct > max_spread:
-            return
-
-        depth_usdt = calc_depth_within_band(payload, band)
-        if depth_usdt < min_depth:
-            return
-
-    if ENABLE_1M_VOLUME_FILTER:
-        t1m = fetch_1m_turnover_usdt(symbol)
-        if t1m < MIN_1M_TURNOVER_USDT:
-            return
-
-if score >= 4 and not fast_blocked:
-    is_long = change_1m > 0 and change_3m > 0
-    is_short = change_1m < 0 and change_3m < 0
-
-    if is_long or is_short:
-        send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score)
-        with lock:
-            last_fast_alert[symbol] = ts
+    if len(hist) < 30:
         return
 
-slow_trigger = (
-    abs(change_15m) >= MOVE_15M
-    or abs(change_1h) >= MOVE_1H
-    or abs(change_24h) >= MOVE_24H
-)
+    p1 = pct(hist[-2][1], price)
+    p5 = pct(hist[-6][1], price)
+    p15 = pct(hist[-20][1], price)
 
-if slow_trigger and not slow_blocked:
-    send_slow_alert(symbol, price, change_15m, change_1h, change_24h)
-    with lock:
-        last_slow_alert[symbol] = ts
-```
+    funding = meta.get("funding", 0)
+    vol = meta.get("vol", 0)
 
-# =========================
+    score = 0
+    signals = []
 
-# Funding extreme
+    # momentum
+    if abs(p1) > MOVE_1M:
+        signals.append(f"1m {round(p1,2)}%")
+        score += 3
 
-# =========================
+    if abs(p5) > MOVE_5M:
+        signals.append(f"5m {round(p5,2)}%")
+        score += 3
 
-def maybe_send_funding_alert(symbol, funding, price):
-if not (funding <= FUNDING_EXTREME_NEG or funding >= FUNDING_EXTREME_POS):
-return
+    if abs(p15) > MOVE_15M:
+        signals.append(f"15m {round(p15,2)}%")
+        score += 4
 
-```
-ts = now_ts()
-key = symbol + "_extreme"
+    # funding
+    if abs(funding) > 0.3:
+        signals.append(f"funding {round(funding,4)}%")
+        score += 2
 
-with lock:
-    last = last_alert_funding.get(key)
+    # volume spike
+    if len(hist) > 10:
+        vspike = abs(pct(hist[-10][1], price))
+        if vspike > VOLUME_SPIKE:
+            signals.append("volume spike")
+            score += 2
 
-if (last is None) or (ts - last >= FUNDING_ALERT_COOLDOWN_SEC):
-    send_funding_extreme_alert(symbol, funding, price)
-    with lock:
-        last_alert_funding[key] = ts
-```
+    # whale move
+    if abs(p5) > WHALE_MOVE:
+        signals.append("whale move detected")
+        score += 3
 
-# =========================
+    # CVD
+    cvd_delta = cvd[symbol]
+    if abs(cvd_delta) > CVD_DIVERGENCE:
+        signals.append("CVD pressure")
+        score += 3
 
-# ★ Liquidation Zones
+    # ACCUMULATION
+    stability = abs(pct(hist[0][1], price))
+    if stability < ACCUM_STABILITY and vol > 400000:
+        signals.append("accumulation zone")
+        score += 2
 
-# =========================
+    # ORDERBOOK FILTER
+    ob = orderbook(symbol)
+    if ob:
+        if ob["spread"] > SPREAD_MAX:
+            return
+        if ob["depth"] < ORDERBOOK_DEPTH_MIN:
+            return
 
-def build_liq_zones(symbol, current_price):
-candles = fetch_klines(symbol, interval=“15”, limit=LIQ_KLINE_LIMIT)
-if len(candles) < 10:
-return {“above”: [], “below”: [], “ts”: now_ts()}
+    # FINAL DECISION
+    if score < 7:
+        return
 
-```
-highs = [safe_float(c[2]) for c in candles]
-lows  = [safe_float(c[3]) for c in candles]
+    direction = "LONG" if p1 > 0 else "SHORT"
 
-local_highs, local_lows = [], []
-for i in range(1, len(highs) - 1):
-    if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
-        local_highs.append(highs[i])
-    if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
-        local_lows.append(lows[i])
-
-def cluster_levels(levels, band_pct):
-    if not levels:
-        return []
-    sorted_lvls = sorted(levels)
-    clusters, cur = [], [sorted_lvls[0]]
-    for lvl in sorted_lvls[1:]:
-        center = sum(cur) / len(cur)
-        if abs(lvl - center) / center * 100 <= band_pct:
-            cur.append(lvl)
-        else:
-            clusters.append(cur)
-            cur = [lvl]
-    clusters.append(cur)
-    result = []
-    for cl in clusters:
-        if len(cl) >= LIQ_MIN_TOUCHES:
-            avg = sum(cl) / len(cl)
-            t   = len(cl)
-            strength = "🔴🔴🔴 עצמה גבוהה מאוד" if t >= 5 else ("🟠🟠 עצמה גבוהה" if t >= 3 else "🟡 עצמה בינונית")
-            result.append({"price": round(avg, 6), "touches": t, "strength": strength})
-    return result
-
-above = cluster_levels([h for h in local_highs if h > current_price], LIQ_CLUSTER_BAND_PCT)
-below = cluster_levels([l for l in local_lows  if l < current_price], LIQ_CLUSTER_BAND_PCT)
-above.sort(key=lambda x: x["price"])
-below.sort(key=lambda x: x["price"], reverse=True)
-return {"above": above[:5], "below": below[:5], "ts": now_ts()}
-```
-
-def get_liq_zones_cached(symbol, current_price):
-cached = liq_zone_cache.get(symbol)
-if cached and (now_ts() - cached[“ts”] < 15 * 60):
-return cached
-zones = build_liq_zones(symbol, current_price)
-liq_zone_cache[symbol] = zones
-return zones
-
-def check_liq_zones(symbol, price):
-ts       = now_ts()
-last_liq = last_liq_zone_alert.get(symbol, 0)
-if ts - last_liq < LIQ_ZONE_ALERT_COOLDOWN_SEC:
-return
-
-```
-zones = get_liq_zones_cached(symbol, price)
-if not zones:
-    return
-
-alerts = []
-for zone in zones["above"]:
-    dist = ((zone["price"] - price) / price) * 100
-    if 0 < dist <= LIQ_ZONE_PROXIMITY_PCT:
-        alerts.append({"dir": "above", "zone": zone, "dist": round(dist, 2), "level": "🚨 קרוב מאוד", "emoji": "⬆️🔴"})
-    elif 0 < dist <= LIQ_ZONE_WARN_PCT:
-        alerts.append({"dir": "above", "zone": zone, "dist": round(dist, 2), "level": "⚠️ אזהרה", "emoji": "⬆️🟡"})
-
-for zone in zones["below"]:
-    dist = ((price - zone["price"]) / price) * 100
-    if 0 < dist <= LIQ_ZONE_PROXIMITY_PCT:
-        alerts.append({"dir": "below", "zone": zone, "dist": round(dist, 2), "level": "🚨 קרוב מאוד", "emoji": "⬇️🟢"})
-    elif 0 < dist <= LIQ_ZONE_WARN_PCT:
-        alerts.append({"dir": "below", "zone": zone, "dist": round(dist, 2), "level": "⚠️ אזהרה", "emoji": "⬇️🟡"})
-
-if not alerts:
-    return
-
-lines = [f"💧 <b>Liquidity Zone Alert</b>", f"<b>{symbol}</b> | 💵 ${price}", "━━━━━━━━━━━━━━━━"]
-for a in alerts:
-    z        = a["zone"]
-    hunt_txt = "🎯 Shorts יצודו" if a["dir"] == "above" else "🎯 Longs יצודו"
-    lines.append(
-        f"{a['emoji']} {a['level']} | ${z['price']} ({a['dist']}%)\n"
-        f"   {z['strength']} ({z['touches']} נגיעות) | {hunt_txt}"
+    send(
+        f"🚨 PRO+ ULTIMATE {symbol}\n"
+        f"{direction}\n"
+        + "\n".join(signals)
+        + f"\nPrice: {price} | Score: {score}"
     )
 
-with lock:
-    meta    = symbol_metadata.get(symbol, {})
-    oi      = meta.get("oi", 0)
-    funding = meta.get("funding", 0.0)
-
-if oi > 0:
-    lines.append(f"📊 OI: ${round(oi/1_000_000, 2)}M")
-if funding != 0:
-    lines.append(f"📉 Funding: {round(funding, 4)}%")
-
-send_telegram("\n".join(lines))
-last_liq_zone_alert[symbol] = ts
-print(f"LIQ ALERT: {symbol}", flush=True)
-```
-
+# =========================
+# CVD
 # =========================
 
-# ★ Volume Profile + Psych
+def update_cvd(symbol, price, prev):
+    if prev <= 0:
+        return
+    delta = price - prev
+    cvd[symbol] += delta
+    cvd_hist[symbol].append((now(), cvd[symbol]))
 
 # =========================
-
-def build_volume_profile(symbol, current_price):
-candles = fetch_klines(symbol, interval=“15”, limit=VP_KLINE_LIMIT)
-if len(candles) < 10:
-return None
-
-```
-highs   = [safe_float(c[2]) for c in candles]
-lows    = [safe_float(c[3]) for c in candles]
-volumes = [safe_float(c[5]) for c in candles]
-
-price_min = min(lows)
-price_max = max(highs)
-if price_max <= price_min:
-    return None
-
-bin_size = (price_max - price_min) / VP_BINS
-bins     = [0.0] * VP_BINS
-
-for i, _ in enumerate(candles):
-    h   = highs[i]
-    l   = lows[i]
-    vol = volumes[i]
-    rng = h - l
-    if rng <= 0:
-        continue
-    for b in range(VP_BINS):
-        bl = price_min + b * bin_size
-        bh = bl + bin_size
-        overlap = max(0, min(h, bh) - max(l, bl))
-        bins[b] += vol * (overlap / rng)
-
-if not any(v > 0 for v in bins):
-    return None
-
-max_vol   = max(bins)
-threshold = max_vol * (VP_HVN_TOP_PCT / 100)
-poc_idx   = bins.index(max_vol)
-poc_price = price_min + (poc_idx + 0.5) * bin_size
-
-hvn_zones = []
-for b in range(VP_BINS):
-    if bins[b] >= threshold:
-        zp       = price_min + (b + 0.5) * bin_size
-        dist_pct = abs(zp - current_price) / current_price * 100
-        if dist_pct <= 5.0:
-            hvn_zones.append({"price": round(zp, 6), "volume": round(bins[b], 2),
-                               "dist_pct": round(dist_pct, 2), "is_poc": (b == poc_idx)})
-
-hvn_zones.sort(key=lambda x: x["dist_pct"])
-return {"poc": round(poc_price, 6), "hvn": hvn_zones[:6], "ts": now_ts()}
-```
-
-def get_vp_cached(symbol, current_price):
-cached = vp_cache.get(symbol)
-if cached and (now_ts() - cached[“ts”] < 20 * 60):
-return cached
-vp = build_volume_profile(symbol, current_price)
-if vp:
-vp_cache[symbol] = vp
-return vp
-
-def get_psych_levels(price):
-import math
-levels = []
-for step in [0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000]:
-if price >= step * 5:
-lo = math.floor(price / step) * step
-hi = math.ceil(price / step) * step
-for lvl in [lo, hi]:
-dist = abs(lvl - price) / price * 100
-if 0 < dist <= PSYCH_PROXIMITY_PCT:
-levels.append({“price”: round(lvl, 8), “dist_pct”: round(dist, 3), “type”: f”round({step})”})
-if price > 10:
-base = int(price)
-for frac in [0.25, 0.50, 0.75]:
-lvl  = base + frac
-dist = abs(lvl - price) / price * 100
-if 0 < dist <= PSYCH_PROXIMITY_PCT:
-levels.append({“price”: lvl, “dist_pct”: round(dist, 3), “type”: “.25/.50/.75”})
-levels.sort(key=lambda x: x[“dist_pct”])
-return levels[:3]
-
-def check_vp_and_psych(symbol, price):
-ts       = now_ts()
-last_vp  = last_liq_zone_alert.get(symbol + “_vp”, 0)
-if ts - last_vp < LIQ_ZONE_ALERT_COOLDOWN_SEC:
-return
-
-```
-lines = []
-
-vp = get_vp_cached(symbol, price)
-if vp:
-    for zone in vp["hvn"]:
-        if zone["dist_pct"] <= 0.8:
-            tag = " 🎯 POC" if zone["is_poc"] else ""
-            lines.append(f"📊 HVN{tag} ב-${zone['price']} (dist {zone['dist_pct']}%)")
-
-for lvl in get_psych_levels(price):
-    lines.append(f"🔢 מספר פסיכולוגי {lvl['type']}: ${lvl['price']} ({lvl['dist_pct']}%)")
-
-if not lines:
-    return
-
-header = [f"📍 <b>Key Level Alert</b>", f"<b>{symbol}</b> | 💵 ${price}", "━━━━━━━━━━━━━━━━"]
-send_telegram("\n".join(header + lines))
-last_liq_zone_alert[symbol + "_vp"] = ts
-print(f"VP/PSYCH ALERT: {symbol}", flush=True)
-```
-
+# WS
 # =========================
 
-# ★ Whale Detection
-
-# =========================
-
-def check_whale_activity(symbol, price):
-ts      = now_ts()
-last_wh = last_whale_alert.get(symbol, 0)
-if ts - last_wh < WHALE_ALERT_COOLDOWN_SEC:
-return
-
-```
-with lock:
-    oi_hist    = list(oi_history[symbol])
-    fund_hist  = list(funding_history[symbol])
-    vol_hist   = list(volume_history[symbol])
-    prices_lx  = list(price_history[symbol])
-    funding    = symbol_metadata.get(symbol, {}).get("funding", 0.0)
-    oi_now     = symbol_metadata.get(symbol, {}).get("oi", 0.0)
-
-if len(oi_hist) < 4 or len(vol_hist) < 4:
-    return
-
-signals    = []
-whale_type = None
-
-oi_trend   = calc_trend(oi_hist)
-price_move = abs(calc_change(prices_lx, 180))
-if oi_trend >= OI_TREND_MIN_PCT and price_move <= PRICE_STABLE_MAX_PCT:
-    signals.append(f"🔍 OI עולה {round(oi_trend,2)}% והמחיר יציב ({round(price_move,2)}%)")
-    whale_type = "ACCUMULATION"
-
-if len(oi_hist) >= 2:
-    oi_change = ((oi_hist[-1] - oi_hist[-2]) / oi_hist[-2]) * 100 if oi_hist[-2] > 0 else 0
-    price_chg = calc_change(prices_lx, 300)
-    if oi_change <= -WHALE_OI_DROP_PCT and price_chg >= 1.5:
-        signals.append(f"📤 OI ירד {round(oi_change,2)}% והמחיר עלה {round(price_chg,2)}% = חלוקה")
-        whale_type = "DISTRIBUTION"
-
-if len(vol_hist) >= 4:
-    avg_vol   = sum(vol_hist[:-1]) / max(len(vol_hist) - 1, 1)
-    vol_spike = vol_hist[-1] / avg_vol if avg_vol > 0 else 1.0
-    price_flat= abs(calc_change(prices_lx, 120))
-    if vol_spike >= WHALE_VOL_SPIKE_NO_MOVE and price_flat <= WHALE_PRICE_STABLE_PCT:
-        signals.append(f"🧲 ווליום x{round(vol_spike,1)} ללא תנועת מחיר ({round(price_flat,2)}%) = ספיגה")
-        whale_type = whale_type or "ABSORPTION"
-
-if len(fund_hist) >= 2:
-    fund_jump = abs(fund_hist[-1] - fund_hist[-2])
-    if fund_jump >= WHALE_FUNDING_JUMP:
-        direction = "LONG" if fund_hist[-1] > fund_hist[-2] else "SHORT"
-        signals.append(f"💥 Funding קפץ {round(fund_jump,4)}% → לוויתן בונה פוזיציה {direction}")
-        whale_type = whale_type or "POSITION_BUILD"
-
-if not signals or not whale_type:
-    return
-
-type_map = {
-    "ACCUMULATION":   ("🟢", "צבירה חבויה",    "המחיר עומד להתקדם למעלה"),
-    "DISTRIBUTION":   ("🔴", "חלוקה (פיזור)",  "הלוויתן מוכר על העליה"),
-    "ABSORPTION":     ("🟡", "ספיגה",           "הלוויתן סופג היצע או ביקוש"),
-    "POSITION_BUILD": ("🔵", "בניית פוזיציה",  "כסף גדול נכנס עכשיו"),
-}
-emoji, type_label, implication = type_map[whale_type]
-
-lines = [
-    f"🐋 <b>Whale Activity Detected</b>",
-    f"<b>{symbol}</b> | 💵 ${price}",
-    "━━━━━━━━━━━━━━━━",
-    f"{emoji} סוג: <b>{type_label}</b>",
-    f"💡 {implication}",
-    "━━━━━━━━━━━━━━━━",
-]
-for s in signals:
-    lines.append(f"• {s}")
-lines.append("━━━━━━━━━━━━━━━━")
-lines.append(f"📊 OI: ${round(oi_now/1_000_000, 2)}M | Funding: {round(funding,4)}%")
-
-lz = liq_zone_cache.get(symbol)
-if lz:
-    if lz.get("above"):
-        n = lz["above"][0]
-        d = round(((n["price"] - price) / price) * 100, 2)
-        lines.append(f"💧 סיוליות מעל: ${n['price']} (+{d}%)")
-    if lz.get("below"):
-        n = lz["below"][0]
-        d = round(((price - n["price"]) / price) * 100, 2)
-        lines.append(f"💧 סיוליות מתחת: ${n['price']} (-{d}%)")
-
-send_telegram("\n".join(lines))
-last_whale_alert[symbol] = ts
-print(f"WHALE ALERT: {symbol} | {whale_type}", flush=True)
-```
-
-# =========================
-
-# ★ CVD
-
-# =========================
-
-def update_cvd(symbol, price, prev_price):
-if prev_price <= 0:
-return
-delta = price - prev_price
-with lock:
-cvd_running[symbol] += delta
-cvd_history[symbol].append((now_ts(), cvd_running[symbol]))
-
-def check_cvd(symbol, price):
-ts       = now_ts()
-last_c   = last_cvd_alert.get(symbol, 0)
-if ts - last_c < CVD_ALERT_COOLDOWN_SEC:
-return
-
-```
-with lock:
-    cvd_hist    = list(cvd_history[symbol])
-    prices_list = list(price_history[symbol])
-
-if len(cvd_hist) < 10 or len(prices_list) < 10:
-    return
-
-cutoff     = ts - CVD_LOOKBACK_SEC
-recent_cvd = [(t, v) for t, v in cvd_hist    if t >= cutoff]
-recent_px  = [(t, p) for t, p in prices_list if t >= cutoff]
-
-if len(recent_cvd) < 6 or len(recent_px) < 6:
-    return
-
-cvd_change = recent_cvd[-1][1] - recent_cvd[0][1]
-px_start   = recent_px[0][1]
-px_end     = recent_px[-1][1]
-px_change  = ((px_end - px_start) / px_start) * 100 if px_start > 0 else 0
-
-pattern     = None
-confidence  = ""
-implication = ""
-
-if px_change <= -CVD_DIVERGE_PRICE_MIN and cvd_change > 0:
-    pattern     = "BULLISH_DIV"
-    confidence  = "🟢🟢🟢 גבוהה" if abs(cvd_change) > abs(recent_cvd[0][1]) * 0.5 else "🟢🟢 בינונית"
-    implication = "קונים סופגים את המכירות בשקט — ריבאונד אפשרי ⬆️"
-
-elif px_change >= CVD_DIVERGE_PRICE_MIN and cvd_change < 0:
-    pattern     = "BEARISH_DIV"
-    confidence  = "🔴🔴🔴 גבוהה" if abs(cvd_change) > abs(recent_cvd[0][1]) * 0.5 else "🔴🔴 בינונית"
-    implication = "מוכרים מחלקים על העלייה — ירידה אפשרית ⬇️"
-
-if len(recent_cvd) >= 20:
-    deltas    = [abs(recent_cvd[i][1] - recent_cvd[i-1][1]) for i in range(1, len(recent_cvd))]
-    avg_delta = sum(deltas[:-3]) / max(len(deltas) - 3, 1) if len(deltas) > 3 else 0
-    last_d    = sum(deltas[-3:]) / 3 if len(deltas) >= 3 else 0
-    if avg_delta > 0 and last_d >= avg_delta * CVD_STRONG_DELTA_X and not pattern:
-        pattern     = "CVD_SPIKE"
-        implication = f"לחץ {'קנייה' if cvd_change > 0 else 'מכירה'} פתאומי x{round(last_d/avg_delta,1)} — תנועה מגיעה"
-        confidence  = "🔵🔵 חזק"
-
-if not pattern:
-    return
-
-label_map = {
-    "BULLISH_DIV": "📈 Bullish CVD Divergence",
-    "BEARISH_DIV": "📉 Bearish CVD Divergence",
-    "CVD_SPIKE":   "⚡ CVD Spike",
-}
-
-with lock:
-    meta    = symbol_metadata.get(symbol, {})
-    oi      = meta.get("oi", 0)
-    funding = meta.get("funding", 0.0)
-
-lines = [
-    f"📊 <b>CVD Alert — {label_map[pattern]}</b>",
-    f"<b>{symbol}</b> | 💵 ${price}",
-    "━━━━━━━━━━━━━━━━",
-    f"🎯 {implication}",
-    f"📶 ביטחון: {confidence}",
-    "━━━━━━━━━━━━━━━━",
-    f"• שינוי מחיר: {round(px_change, 2)}% ב-{CVD_LOOKBACK_SEC//60}m",
-    f"• שינוי CVD: {'+' if cvd_change > 0 else ''}{round(cvd_change, 4)}",
-    f"• כיוון CVD: {'🟢 קנייה נטו' if cvd_change > 0 else '🔴 מכירה נטו'}",
-]
-if oi > 0:
-    lines.append(f"📊 OI: ${round(oi/1_000_000, 2)}M")
-if funding != 0:
-    lines.append(f"📉 Funding: {round(funding, 4)}%")
-
-lz = liq_zone_cache.get(symbol)
-if lz:
-    if pattern == "BULLISH_DIV" and lz.get("above"):
-        n = lz["above"][0]
-        d = round(((n["price"] - price) / price) * 100, 2)
-        lines.append(f"💧 יעד אפשרי: ${n['price']} (+{d}%)")
-    elif pattern == "BEARISH_DIV" and lz.get("below"):
-        n = lz["below"][0]
-        d = round(((price - n["price"]) / price) * 100, 2)
-        lines.append(f"💧 יעד אפשרי: ${n['price']} (-{d}%)")
-
-send_telegram("\n".join(lines))
-last_cvd_alert[symbol] = ts
-print(f"CVD ALERT: {symbol} | {pattern}", flush=True)
-```
-
-# =========================
-
-# WebSocket
-
-# =========================
-
-def subscribe_symbols(ws, symbols):
-batch_size = 50
-for i in range(0, len(symbols), batch_size):
-batch = symbols[i:i + batch_size]
-topics = [“tickers.” + s for s in batch]
-try:
-ws.send(json.dumps({“op”: “subscribe”, “args”: topics}))
-except Exception as e:
-print(f”Subscribe batch error: {e}”, flush=True)
-time.sleep(0.25)
-
-def resubscribe_loop():
-global current_symbols, ws_app
-
-```
-while True:
+def on_message(ws, msg):
     try:
-        new_symbols = get_top_symbols()
+        data = json.loads(msg)
+
+        if "tickers." not in data.get("topic", ""):
+            return
+
+        d = data["data"]
+        symbol = d.get("symbol")
+        price = f(d.get("lastPrice"))
+
+        if not symbol or price <= 0:
+            return
+
+        ts = now()
 
         with lock:
-            existing = set(current_symbols)
-            to_add = [s for s in new_symbols if s not in existing]
+            prev = last_price.get(symbol, 0)
+            price_history[symbol].append((ts, price))
+            last_price[symbol] = price
 
-        if to_add:
-            with ws_lock:
-                ws = ws_app
+        engine(symbol, price)
+        update_cvd(symbol, price, prev)
 
-            if ws:
-                subscribe_symbols(ws, to_add)
-                with lock:
-                    current_symbols.extend(to_add)
-                print(f"Resubscribed {len(to_add)} new symbols", flush=True)
-
-    except Exception as e:
-        print(f"Resubscribe error: {e}", flush=True)
-
-    time.sleep(RESUBSCRIBE_EVERY_SEC)
-```
-
-def on_message(ws, message):
-try:
-data = json.loads(message)
-topic = data.get(“topic”, “”)
-
-```
-    if not topic.startswith("tickers."):
-        return
-
-    ticker_data = data.get("data") or {}
-    symbol = ticker_data.get("symbol") or ""
-    last_price = safe_float(ticker_data.get("lastPrice", 0))
-    print(symbol, last_price, flush=True)
-
-    if not symbol or last_price <= 0:
-        return
-
-    ts = now_ts()
-    with lock:
-        prev_price = last_price_cache.get(symbol, 0.0)
-        price_history[symbol].append((ts, last_price))
-        last_price_cache[symbol] = last_price
-        funding = (symbol_metadata.get(symbol, {}) or {}).get("funding", 0.0)
-
-    # الفحوصات الأصلية — لا تتغير
-    maybe_send_funding_alert(symbol, funding, last_price)
-    check_signals(symbol, last_price)
-    check_accumulation(symbol, last_price)
-
-    # الإضافات — كل واحدة معزولة
-    try:
-        check_liq_zones(symbol, last_price)
-    except Exception as e:
-        print(f"liq_zones error {symbol}: {e}", flush=True)
-
-    try:
-        check_whale_activity(symbol, last_price)
-    except Exception as e:
-        print(f"whale error {symbol}: {e}", flush=True)
-
-    try:
-        check_vp_and_psych(symbol, last_price)
-    except Exception as e:
-        print(f"vp_psych error {symbol}: {e}", flush=True)
-
-    try:
-        update_cvd(symbol, last_price, prev_price)
-        check_cvd(symbol, last_price)
-    except Exception as e:
-        print(f"cvd error {symbol}: {e}", flush=True)
-
-except Exception as e:
-    print(f"Message error: {e}", flush=True)
-```
-
-def on_error(ws, error):
-print(f”WebSocket error: {error}”, flush=True)
-
-def on_close(ws, close_status_code, close_msg):
-print(f”WebSocket closed | code={close_status_code} | msg={close_msg}”, flush=True)
+    except:
+        pass
 
 def on_open(ws):
-global current_symbols
-print(“WebSocket connected!”, flush=True)
+    print("PRO+ ULTIMATE ONLINE")
 
-```
-symbols = get_top_symbols()
-with lock:
-    current_symbols = list(symbols)
+def start():
+    ws = websocket.WebSocketApp(
+        "wss://stream.bybit.com/v5/public/linear",
+        on_message=on_message,
+        on_open=on_open
+    )
 
-subscribe_symbols(ws, symbols)
-print(f"Subscribed: {len(symbols)} symbols", flush=True)
-```
-
-def start_websocket():
-global ws_app
-
-```
-ws_url = "wss://stream.bybit.com/v5/public/linear"
-ws = websocket.WebSocketApp(
-    ws_url,
-    on_open=on_open,
-    on_message=on_message,
-    on_error=on_error,
-    on_close=on_close,
-)
-
-with ws_lock:
-    ws_app = ws
-
-ws.run_forever(
-    ping_interval=20,
-    ping_timeout=10,
-    reconnect=5,
-)
-```
+    ws.run_forever(ping_interval=20, ping_timeout=10)
 
 # =========================
-
-# Main
-
+# MAIN
 # =========================
 
-if **name** == “**main**”:
-print(“MOHAMED NEW VERSION LIVE”, flush=True)
+if __name__ == "__main__":
+    print("🔥 PRO+ ULTIMATE STARTED")
 
-```
-threading.Thread(target=update_metadata, daemon=True).start()
-threading.Thread(target=resubscribe_loop, daemon=True).start()
+    threading.Thread(target=update_meta, daemon=True).start()
 
-while True:
-    try:
-        start_websocket()
-    except Exception as e:
-        print(f"WebSocket crashed: {e}", flush=True)
-        print("Reconnecting in 10s...", flush=True)
-        time.sleep(10)
-```
+    while True:
+        try:
+            start()
+        except Exception as e:
+            print("restart", e)
+            time.sleep(5)
