@@ -1,4 +1,4 @@
-Import os
+import os
 import json
 import time
 import threading
@@ -103,7 +103,7 @@ def handle_subscribe(user_id, first_name):
         f"📋 Wallet Address:\n"
         f"<code>{WALLET_USDT}</code>\n\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"After payment, send the <b>transaction hash</b> here\n"
+        After payment, send the <b>transaction hash</b> here\n"
         f"Your subscription will be activated within minutes ✅\n\n"
         f"⚠️ Make sure to send the exact amount on TRC20 network only"
     )
@@ -269,7 +269,7 @@ def main():
                         handle_admin_cmd(user_id, text)
                     elif text == "/start":
                         handle_start(user_id, msg["from"].get("username"), msg["from"].get("first_name"))
-                    elif len(text) == 64: # פשוט בודק אורך של hash טיפוסי
+                    elif len(text) == 64: # فحص بسيط لطول الهاش
                         handle_hash(user_id, msg["from"].get("username"), msg["from"].get("first_name"), text)
 
         except Exception as e:
