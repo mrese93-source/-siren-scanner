@@ -7,21 +7,21 @@ from datetime import datetime, timedelta
 import requests
 
 # =========================
-# إعدادات
+# CONFIG
 # =========================
 
-BOT_TOKEN   = "PUT_YOUR_BOT_TOKEN_HERE"
-CHANNEL_ID  = -1003976387571
-PRICE_USD   = 25
-SUB_DAYS    = 30
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = -1003976387571
 
-WALLET_USDT = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
+PRICE_USD = 25
+SUB_DAYS = 30
+WALLET = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
 
-DB_FILE     = "subscribers.json"
-BASE_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}"
+DB_FILE = "db.json"
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================
-# DB
+# DATABASE
 # =========================
 
 def load_db():
@@ -29,14 +29,14 @@ def load_db():
         with open(DB_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"subscribers": {}, "pending": {}, "admin_id": None}
+        return {"subs": {}, "pending": {}, "admin": None}
 
 def save_db(db):
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=2)
 
 # =========================
-# Telegram
+# TELEGRAM
 # =========================
 
 def tg(method, data=None):
@@ -55,11 +55,7 @@ def send(chat_id, text, keyboard=None):
     }
     if keyboard:
         data["reply_markup"] = keyboard
-    return tg("sendMessage", data)
-
-def kick_user(user_id):
-    tg("banChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
-    tg("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
+    tg("sendMessage", data)
 
 def create_invite():
     res = tg("createChatInviteLink", {
@@ -69,173 +65,173 @@ def create_invite():
     })
     return res.get("result", {}).get("invite_link")
 
+def kick(user_id):
+    tg("banChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
+    tg("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
+
 # =========================
-# Handlers
+# LOGIC
 # =========================
 
-def handle_start(user_id, username, fname):
+def start(user_id):
     db = load_db()
 
-    sub = db["subscribers"].get(str(user_id))
+    sub = db["subs"].get(str(user_id))
     if sub:
-        exp = datetime.fromisoformat(sub["expires"])
+        exp = datetime.fromisoformat(sub["exp"])
         if exp > datetime.now():
             days = (exp - datetime.now()).days
-            send(user_id, f"✅ Active — {days} days left")
+            send(user_id, f"✅ اشتراكك فعال — باقي {days} يوم")
             return
 
     keyboard = {
         "inline_keyboard": [[
-            {"text": "💳 Subscribe", "callback_data": "subscribe"}
+            {"text": "💳 اشتراك", "callback_data": "sub"}
         ]]
     }
 
     send(user_id,
-        f"🎯 <b>Sniper Signals</b>\n\n"
-        f"💰 ${PRICE_USD} / month\n"
-        f"USDT TRC20\n\n"
-        f"Click below to subscribe",
+        f"🎯 Sniper Signals\n\n"
+        f"💰 السعر: {PRICE_USD}$\n"
+        f"الدفع USDT TRC20\n\n"
+        f"اضغط للاشتراك",
         keyboard
     )
 
-def handle_subscribe(user_id):
+def subscribe(user_id):
     send(user_id,
-        f"💳 Send <b>${PRICE_USD} USDT</b> (TRC20)\n\n"
-        f"<code>{WALLET_USDT}</code>\n\n"
-        f"Then send TX HASH"
+        f"💳 أرسل {PRICE_USD} USDT (TRC20)\n\n"
+        f"<code>{WALLET}</code>\n\n"
+        f"ثم أرسل TX HASH"
     )
 
-def handle_hash(user_id, username, fname, tx):
+def new_hash(user_id, tx):
     db = load_db()
 
     db["pending"][str(user_id)] = {
-        "username": username,
-        "fname": fname,
         "tx": tx,
         "time": datetime.now().isoformat()
     }
 
     save_db(db)
 
-    send(user_id, "⏳ Waiting for approval...")
+    send(user_id, "⏳ بانتظار الموافقة")
 
-    admin = db.get("admin_id")
+    admin = db.get("admin")
     if admin:
         keyboard = {
             "inline_keyboard": [[
-                {"text": "✅ Approve", "callback_data": f"approve_{user_id}"},
-                {"text": "❌ Reject",  "callback_data": f"reject_{user_id}"}
+                {"text": "✅", "callback_data": f"ok_{user_id}"},
+                {"text": "❌", "callback_data": f"no_{user_id}"}
             ]]
         }
 
-        send(admin,
-            f"User: @{username}\nTX:\n<code>{tx}</code>",
-            keyboard
-        )
+        send(admin, f"User {user_id}\n<code>{tx}</code>", keyboard)
 
-def approve_user(uid):
+def approve(uid):
     db = load_db()
 
-    p = db["pending"].get(str(uid))
-    if not p:
-        return False
+    if str(uid) not in db["pending"]:
+        return
 
-    invite = create_invite()
-    if not invite:
-        return False
+    link = create_invite()
+    if not link:
+        return
 
     exp = (datetime.now() + timedelta(days=SUB_DAYS)).isoformat()
 
-    db["subscribers"][str(uid)] = {
-        "expires": exp
-    }
-
+    db["subs"][str(uid)] = {"exp": exp}
     del db["pending"][str(uid)]
+
     save_db(db)
 
-    send(uid, f"✅ Approved\n{invite}")
-    return True
+    send(uid, f"✅ تم التفعيل\n{link}")
 
-def reject_user(uid):
+def reject(uid):
     db = load_db()
 
     if str(uid) in db["pending"]:
         del db["pending"][str(uid)]
         save_db(db)
 
-    send(uid, "❌ Payment rejected")
-
-def handle_admin(user_id, text):
-    db = load_db()
-
-    if text == "/admin":
-        db["admin_id"] = user_id
-        save_db(db)
-        send(user_id, "✅ Admin set")
+    send(uid, "❌ تم الرفض")
 
 # =========================
-# Expiry
+# EXPIRY
 # =========================
 
-def check_expired():
+def checker():
     while True:
         db = load_db()
         now = datetime.now()
 
-        for uid, sub in list(db["subscribers"].items()):
-            if datetime.fromisoformat(sub["expires"]) < now:
-                kick_user(int(uid))
-                del db["subscribers"][uid]
+        changed = False
 
-        save_db(db)
+        for uid, sub in list(db["subs"].items()):
+            if datetime.fromisoformat(sub["exp"]) < now:
+                kick(int(uid))
+                del db["subs"][uid]
+                changed = True
+
+        if changed:
+            save_db(db)
+
         time.sleep(3600)
 
 # =========================
-# Main
+# MAIN
 # =========================
 
 def main():
     offset = 0
 
-    threading.Thread(target=check_expired, daemon=True).start()
+    threading.Thread(target=checker, daemon=True).start()
 
     while True:
-        res = tg("getUpdates", {"offset": offset})
-        updates = res.get("result", [])
+        try:
+            res = tg("getUpdates", {"offset": offset, "timeout": 30})
+            updates = res.get("result", [])
 
-        for u in updates:
-            offset = u["update_id"] + 1
+            for u in updates:
+                offset = u["update_id"] + 1
 
-            if "callback_query" in u:
-                data = u["callback_query"]["data"]
-                uid  = u["callback_query"]["from"]["id"]
+                if "callback_query" in u:
+                    data = u["callback_query"]["data"]
+                    uid = u["callback_query"]["from"]["id"]
 
-                tg("answerCallbackQuery", {
-                    "callback_query_id": u["callback_query"]["id"]
-                })
+                    tg("answerCallbackQuery", {
+                        "callback_query_id": u["callback_query"]["id"]
+                    })
 
-                if data == "subscribe":
-                    handle_subscribe(uid)
+                    if data == "sub":
+                        subscribe(uid)
 
-                elif data.startswith("approve_"):
-                    approve_user(int(data.split("_")[1]))
+                    elif data.startswith("ok_"):
+                        approve(int(data.split("_")[1]))
 
-                elif data.startswith("reject_"):
-                    reject_user(int(data.split("_")[1]))
+                    elif data.startswith("no_"):
+                        reject(int(data.split("_")[1]))
 
-            elif "message" in u:
-                msg = u["message"]
-                uid = msg["from"]["id"]
-                text = msg.get("text", "")
+                elif "message" in u:
+                    msg = u["message"]
+                    uid = msg["from"]["id"]
+                    text = msg.get("text", "")
 
-                if text == "/start":
-                    handle_start(uid, "", "")
+                    if text == "/start":
+                        start(uid)
 
-                elif text == "/admin":
-                    handle_admin(uid, text)
+                    elif text == "/admin":
+                        db = load_db()
+                        db["admin"] = uid
+                        save_db(db)
+                        send(uid, "✅ أنت الأدمن")
 
-                elif len(text) == 64:
-                    handle_hash(uid, "", "", text)
+                    elif len(text) == 64:
+                        new_hash(uid, text)
+
+        except Exception as e:
+            print("ERROR:", e)
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
