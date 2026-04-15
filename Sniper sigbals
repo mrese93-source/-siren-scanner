@@ -1,18 +1,3 @@
-# “””
-🎯 SNIPER SIGNALS — Subscription Bot
-
-بوت الاشتراك لقناة Sniper Signals
-
-كيف يعمل:
-
-1. العميل يرسل /start
-1. يشوف تعليمات الدفع
-1. يرسل hash الصفقة
-1. الأدمن يؤكد الدفع
-1. البوت يضيفه للقناة تلقائياً
-1. بعد 30 يوم يُحذف تلقائياً
-   “””
-
 import os
 import json
 import time
@@ -22,413 +7,235 @@ from datetime import datetime, timedelta
 import requests
 
 # =========================
-
-# إعدادات — لا تغير هذه
-
+# إعدادات
 # =========================
 
-BOT_TOKEN   = “8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA”
+BOT_TOKEN   = "PUT_YOUR_BOT_TOKEN_HERE"
 CHANNEL_ID  = -1003976387571
-ADMIN_ID    = None  # سيتحدد تلقائياً أول مرة تكتب /admin
-WALLET_USDT = “TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr”
 PRICE_USD   = 25
 SUB_DAYS    = 30
 
-DB_FILE     = “subscribers.json”
-BASE_URL    = f”https://api.telegram.org/bot{BOT_TOKEN}”
+WALLET_USDT = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
+
+DB_FILE     = "subscribers.json"
+BASE_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================
-
-# قاعدة البيانات (JSON)
-
+# DB
 # =========================
 
 def load_db():
-try:
-with open(DB_FILE, “r”) as f:
-return json.load(f)
-except Exception:
-return {“subscribers”: {}, “pending”: {}, “admin_id”: None}
+    try:
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"subscribers": {}, "pending": {}, "admin_id": None}
 
 def save_db(db):
-with open(DB_FILE, “w”) as f:
-json.dump(db, f, indent=2)
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=2)
 
 # =========================
-
-# Telegram API
-
+# Telegram
 # =========================
 
-def tg(method, data={}):
-try:
-r = requests.post(f”{BASE_URL}/{method}”, json=data, timeout=10)
-return r.json()
-except Exception as e:
-print(f”TG Error: {e}”)
-return {}
+def tg(method, data=None):
+    try:
+        r = requests.post(f"{BASE_URL}/{method}", json=data or {}, timeout=10)
+        return r.json()
+    except Exception as e:
+        print("TG ERROR:", e)
+        return {}
 
-def send(chat_id, text, reply_markup=None):
-data = {“chat_id”: chat_id, “text”: text, “parse_mode”: “HTML”}
-if reply_markup:
-data[“reply_markup”] = reply_markup
-return tg(“sendMessage”, data)
+def send(chat_id, text, keyboard=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if keyboard:
+        data["reply_markup"] = keyboard
+    return tg("sendMessage", data)
 
 def kick_user(user_id):
-tg(“banChatMember”,   {“chat_id”: CHANNEL_ID, “user_id”: user_id})
-tg(“unbanChatMember”, {“chat_id”: CHANNEL_ID, “user_id”: user_id})
+    tg("banChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
+    tg("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
 
 def create_invite():
-result = tg(“createChatInviteLink”, {
-“chat_id”:     CHANNEL_ID,
-“member_limit”: 1,
-“expire_date”:  int(time.time()) + 3600
-})
-return result.get(“result”, {}).get(“invite_link”)
+    res = tg("createChatInviteLink", {
+        "chat_id": CHANNEL_ID,
+        "member_limit": 1,
+        "expire_date": int(time.time()) + 3600
+    })
+    return res.get("result", {}).get("invite_link")
 
 # =========================
-
-# معالجة الرسائل
-
+# Handlers
 # =========================
 
-def handle_start(user_id, username, first_name):
-db = load_db()
+def handle_start(user_id, username, fname):
+    db = load_db()
 
-```
-# تحقق إذا مشترك نشط
-sub = db["subscribers"].get(str(user_id))
-if sub:
-    exp = datetime.fromisoformat(sub["expires"])
-    remaining = (exp - datetime.now()).days
-    if remaining > 0:
-        send(user_id,
-            f"✅ Welcome back, {first_name}!\n"
-            f"Your subscription is active — expires in <b>{remaining} days</b>"
-        )
-        return
+    sub = db["subscribers"].get(str(user_id))
+    if sub:
+        exp = datetime.fromisoformat(sub["expires"])
+        if exp > datetime.now():
+            days = (exp - datetime.now()).days
+            send(user_id, f"✅ Active — {days} days left")
+            return
 
-msg = (
-    f"🎯 <b>Sniper Signals</b>\n"
-    f"The sharpest Futures alert bot on the market\n\n"
-    f"━━━━━━━━━━━━━━━━\n"
-    f"💎 <b>What you get:</b>\n"
-    f"• Real-time OI + Funding alerts\n"
-    f"• Whale accumulation & distribution detection\n"
-    f"• Liquidity zones before the move\n"
-    f"• CVD Divergence signals\n"
-    f"• 600+ Futures pairs covered\n\n"
-    f"━━━━━━━━━━━━━━━━\n"
-    f"💰 Price: <b>${PRICE_USD} / month</b>\n"
-    f"💳 Payment: USDT TRC20\n\n"
-    f"Subscribe now 👇"
-)
-keyboard = {
-    "inline_keyboard": [[
-        {"text": "💳 Subscribe Now", "callback_data": "subscribe"}
-    ]]
-}
-send(user_id, msg, keyboard)
-```
-
-def handle_subscribe(user_id, first_name):
-msg = (
-f”💳 <b>Payment Instructions</b>\n\n”
-f”Send <b>${PRICE_USD} USDT</b> on the <b>TRC20</b> network\n\n”
-f”📋 Wallet Address:\n”
-f”<code>{WALLET_USDT}</code>\n\n”
-f”━━━━━━━━━━━━━━━━\n”
-f”After payment, send the <b>transaction hash</b> here\n”
-f”Your subscription will be activated within minutes ✅\n\n”
-f”⚠️ Make sure to send the exact amount on TRC20 network only”
-)
-send(user_id, msg)
-
-def handle_hash(user_id, username, first_name, tx_hash):
-db = load_db()
-
-```
-# حفظ الطلب
-db["pending"][str(user_id)] = {
-    "user_id":    user_id,
-    "username":   username or "",
-    "first_name": first_name or "",
-    "tx_hash":    tx_hash,
-    "timestamp":  datetime.now().isoformat()
-}
-save_db(db)
-
-# إشعار العميل
-send(user_id,
-    f"⏳ Hash received!\n"
-    f"We will verify and activate your subscription within minutes ✅"
-)
-
-# إشعار الأدمن
-admin_id = db.get("admin_id")
-if admin_id:
-    user_link = f"@{username}" if username else first_name
     keyboard = {
         "inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"approve_{user_id}"},
-            {"text": "❌ Reject",  "callback_data": f"reject_{user_id}"}
+            {"text": "💳 Subscribe", "callback_data": "subscribe"}
         ]]
     }
-    send(admin_id,
-        f"🔔 <b>New Subscription Request</b>\n\n"
-        f"👤 User: {user_link}\n"
-        f"🔗 Hash: <code>{tx_hash}</code>\n\n"
-        f"Verify transaction at:\n"
-        f"https://tronscan.org/#/transaction/{tx_hash}",
+
+    send(user_id,
+        f"🎯 <b>Sniper Signals</b>\n\n"
+        f"💰 ${PRICE_USD} / month\n"
+        f"USDT TRC20\n\n"
+        f"Click below to subscribe",
         keyboard
     )
-else:
-    print(f"NEW PENDING: {user_id} | {tx_hash}")
-```
 
-def approve_user(user_id):
-db = load_db()
-pending = db[“pending”].get(str(user_id))
-if not pending:
-return False
-
-```
-# إنشاء رابط دعوة
-invite = create_invite()
-if not invite:
-    return False
-
-# حفظ المشترك
-expires = (datetime.now() + timedelta(days=SUB_DAYS)).isoformat()
-db["subscribers"][str(user_id)] = {
-    "user_id":    user_id,
-    "username":   pending.get("username", ""),
-    "first_name": pending.get("first_name", ""),
-    "expires":    expires,
-    "tx_hash":    pending.get("tx_hash", ""),
-    "joined":     datetime.now().isoformat()
-}
-
-# حذف من المعلقين
-del db["pending"][str(user_id)]
-save_db(db)
-
-# إرسال الرابط للعميل
-send(user_id,
-    f"🎯 <b>Subscription Activated!</b>\n\n"
-    f"Welcome to Sniper Signals 🐋\n\n"
-    f"🔗 Your private channel link:\n{invite}\n\n"
-    f"⚠️ This link is valid for one use only\n"
-    f"📅 Subscription valid until: {expires[:10]}"
-)
-return True
-```
-
-def reject_user(user_id):
-db = load_db()
-if str(user_id) in db[“pending”]:
-del db[“pending”][str(user_id)]
-save_db(db)
-
-```
-send(user_id,
-    f"❌ Payment could not be verified\n\n"
-    f"Please make sure:\n"
-    f"• You sent the correct amount (${PRICE_USD} USDT)\n"
-    f"• You used the TRC20 network\n"
-    f"• You sent the correct transaction hash\n\n"
-    f"For help, contact support"
-)
-```
-
-def handle_admin_cmd(user_id, text):
-db = load_db()
-
-```
-if text == "/admin":
-    db["admin_id"] = user_id
-    save_db(db)
-    send(user_id, "✅ You are now registered as admin")
-    return
-
-if text == "/stats":
-    subs   = len(db["subscribers"])
-    pending= len(db["pending"])
-    active = sum(
-        1 for s in db["subscribers"].values()
-        if datetime.fromisoformat(s["expires"]) > datetime.now()
-    )
+def handle_subscribe(user_id):
     send(user_id,
-        f"📊 <b>Sniper Signals Stats</b>\n\n"
-        f"✅ Active subscribers: {active}\n"
-        f"👥 Total subscribers: {subs}\n"
-        f"⏳ Pending requests: {pending}"
+        f"💳 Send <b>${PRICE_USD} USDT</b> (TRC20)\n\n"
+        f"<code>{WALLET_USDT}</code>\n\n"
+        f"Then send TX HASH"
     )
-    return
 
-if text == "/pending":
-    pending = db["pending"]
-    if not pending:
-        send(user_id, "No pending requests")
-        return
-    for uid, p in pending.items():
-        user_link = f"@{p['username']}" if p.get('username') else p.get('first_name', uid)
+def handle_hash(user_id, username, fname, tx):
+    db = load_db()
+
+    db["pending"][str(user_id)] = {
+        "username": username,
+        "fname": fname,
+        "tx": tx,
+        "time": datetime.now().isoformat()
+    }
+
+    save_db(db)
+
+    send(user_id, "⏳ Waiting for approval...")
+
+    admin = db.get("admin_id")
+    if admin:
         keyboard = {
             "inline_keyboard": [[
-                {"text": "✅ Approve", "callback_data": f"approve_{uid}"},
-                {"text": "❌ Reject",  "callback_data": f"reject_{uid}"}
+                {"text": "✅ Approve", "callback_data": f"approve_{user_id}"},
+                {"text": "❌ Reject",  "callback_data": f"reject_{user_id}"}
             ]]
         }
-        send(user_id,
-            f"👤 {user_link}\n"
-            f"🔗 <code>{p['tx_hash']}</code>\n"
-            f"🕐 {p['timestamp'][:16]}",
+
+        send(admin,
+            f"User: @{username}\nTX:\n<code>{tx}</code>",
             keyboard
         )
-    return
 
-if text == "/subs":
-    subs = db["subscribers"]
-    if not subs:
-        send(user_id, "No active subscribers")
-        return
-    lines = ["👥 <b>Active Subscribers:</b>\n"]
-    for uid, s in subs.items():
-        exp  = datetime.fromisoformat(s["expires"])
-        days = (exp - datetime.now()).days
-        if days > 0:
-            name = f"@{s['username']}" if s.get('username') else s.get('first_name', uid)
-            lines.append(f"• {name} — {days} days left")
-    send(user_id, "\n".join(lines))
-    return
-```
+def approve_user(uid):
+    db = load_db()
+
+    p = db["pending"].get(str(uid))
+    if not p:
+        return False
+
+    invite = create_invite()
+    if not invite:
+        return False
+
+    exp = (datetime.now() + timedelta(days=SUB_DAYS)).isoformat()
+
+    db["subscribers"][str(uid)] = {
+        "expires": exp
+    }
+
+    del db["pending"][str(uid)]
+    save_db(db)
+
+    send(uid, f"✅ Approved\n{invite}")
+    return True
+
+def reject_user(uid):
+    db = load_db()
+
+    if str(uid) in db["pending"]:
+        del db["pending"][str(uid)]
+        save_db(db)
+
+    send(uid, "❌ Payment rejected")
+
+def handle_admin(user_id, text):
+    db = load_db()
+
+    if text == "/admin":
+        db["admin_id"] = user_id
+        save_db(db)
+        send(user_id, "✅ Admin set")
 
 # =========================
-
-# فحص المشتركين المنتهين
-
+# Expiry
 # =========================
 
 def check_expired():
-while True:
-try:
-db = load_db()
-now = datetime.now()
-expired = []
+    while True:
+        db = load_db()
+        now = datetime.now()
 
-```
-        for uid, sub in db["subscribers"].items():
-            exp = datetime.fromisoformat(sub["expires"])
-            if exp < now:
-                expired.append(uid)
+        for uid, sub in list(db["subscribers"].items()):
+            if datetime.fromisoformat(sub["expires"]) < now:
+                kick_user(int(uid))
+                del db["subscribers"][uid]
 
-        for uid in expired:
-            user_id = int(uid)
-            kick_user(user_id)
-            send(user_id,
-                f"⚠️ Your Sniper Signals subscription has expired\n\n"
-                f"To renew, send /start"
-            )
-            del db["subscribers"][uid]
-            print(f"Expired & kicked: {uid}")
-
-        if expired:
-            save_db(db)
-
-    except Exception as e:
-        print(f"Expiry check error: {e}")
-
-    time.sleep(3600)  # فحص كل ساعة
-```
+        save_db(db)
+        time.sleep(3600)
 
 # =========================
-
-# الحلقة الرئيسية
-
+# Main
 # =========================
 
 def main():
-print(“🎯 Sniper Signals Bot — Started”, flush=True)
-offset = 0
+    offset = 0
 
-```
-# تشغيل فحص المنتهين في خيط منفصل
-threading.Thread(target=check_expired, daemon=True).start()
+    threading.Thread(target=check_expired, daemon=True).start()
 
-while True:
-    try:
-        result = tg("getUpdates", {"offset": offset, "timeout": 30})
-        updates = result.get("result", [])
+    while True:
+        res = tg("getUpdates", {"offset": offset})
+        updates = res.get("result", [])
 
-        for update in updates:
-            offset = update["update_id"] + 1
+        for u in updates:
+            offset = u["update_id"] + 1
 
-            # Callback (أزرار الأدمن)
-            if "callback_query" in update:
-                cb      = update["callback_query"]
-                cb_id   = cb["id"]
-                data    = cb.get("data", "")
-                from_id = cb["from"]["id"]
+            if "callback_query" in u:
+                data = u["callback_query"]["data"]
+                uid  = u["callback_query"]["from"]["id"]
 
-                tg("answerCallbackQuery", {"callback_query_id": cb_id})
+                tg("answerCallbackQuery", {
+                    "callback_query_id": u["callback_query"]["id"]
+                })
 
                 if data == "subscribe":
-                    handle_subscribe(from_id, cb["from"].get("first_name", ""))
+                    handle_subscribe(uid)
 
                 elif data.startswith("approve_"):
-                    uid = int(data.split("_")[1])
-                    ok  = approve_user(uid)
-                    db  = load_db()
-                    admin_id = db.get("admin_id")
-                    if admin_id:
-                        send(admin_id, "✅ Subscriber approved" if ok else "❌ Failed — check bot permissions")
+                    approve_user(int(data.split("_")[1]))
 
                 elif data.startswith("reject_"):
-                    uid = int(data.split("_")[1])
-                    reject_user(uid)
-                    db  = load_db()
-                    admin_id = db.get("admin_id")
-                    if admin_id:
-                        send(admin_id, "❌ Request rejected")
+                    reject_user(int(data.split("_")[1]))
 
-            # رسالة عادية
-            elif "message" in update:
-                msg      = update["message"]
-                user_id  = msg["from"]["id"]
-                username = msg["from"].get("username", "")
-                fname    = msg["from"].get("first_name", "")
-                text     = msg.get("text", "").strip()
+            elif "message" in u:
+                msg = u["message"]
+                uid = msg["from"]["id"]
+                text = msg.get("text", "")
 
-                if not text:
-                    continue
+                if text == "/start":
+                    handle_start(uid, "", "")
 
-                db       = load_db()
-                admin_id = db.get("admin_id")
-                is_admin = (admin_id and user_id == admin_id)
+                elif text == "/admin":
+                    handle_admin(uid, text)
 
-                # أوامر الأدمن
-                if text.startswith("/") and (is_admin or text == "/admin"):
-                    handle_admin_cmd(user_id, text)
+                elif len(text) == 64:
+                    handle_hash(uid, "", "", text)
 
-                # /start
-                elif text == "/start":
-                    handle_start(user_id, username, fname)
-
-                # hash الصفقة (64 حرف hex)
-                elif len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
-                    handle_hash(user_id, username, fname, text)
-
-                # رسالة غير معروفة
-                else:
-                    send(user_id,
-                        "للبدء اضغط /start\n"
-                        "بعد الدفع أرسل hash الصفقة مباشرة"
-                    )
-
-    except Exception as e:
-        print(f"Main loop error: {e}", flush=True)
-        time.sleep(5)
-```
-
-if **name** == “**main**”:
-main()
+if __name__ == "__main__":
+    main()
