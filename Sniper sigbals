@@ -1,28 +1,15 @@
 import os
 import json
 import time
-import threading
 from datetime import datetime, timedelta
-
+import threading
 import requests
-
-# =========================
-# CONFIG
-# =========================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = -1003976387571
 
-PRICE_USD = 25
-SUB_DAYS = 30
-WALLET = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
-
 DB_FILE = "db.json"
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# =========================
-# DATABASE
-# =========================
 
 def load_db():
     try:
@@ -33,205 +20,37 @@ def load_db():
 
 def save_db(db):
     with open(DB_FILE, "w") as f:
-        json.dump(db, f, indent=2)
-
-# =========================
-# TELEGRAM
-# =========================
+        json.dump(db, f)
 
 def tg(method, data=None):
     try:
-        r = requests.post(f"{BASE_URL}/{method}", json=data or {}, timeout=10)
-        return r.json()
-    except Exception as e:
-        print("TG ERROR:", e)
+        return requests.post(f"{BASE_URL}/{method}", json=data or {}).json()
+    except:
         return {}
 
-def send(chat_id, text, keyboard=None):
-    data = {
+def send(chat_id, text):
+    tg("sendMessage", {
         "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    if keyboard:
-        data["reply_markup"] = keyboard
-    tg("sendMessage", data)
-
-def create_invite():
-    res = tg("createChatInviteLink", {
-        "chat_id": CHANNEL_ID,
-        "member_limit": 1,
-        "expire_date": int(time.time()) + 3600
+        "text": text
     })
-    return res.get("result", {}).get("invite_link")
-
-def kick(user_id):
-    tg("banChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
-    tg("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
-
-# =========================
-# LOGIC
-# =========================
-
-def start(user_id):
-    db = load_db()
-
-    sub = db["subs"].get(str(user_id))
-    if sub:
-        exp = datetime.fromisoformat(sub["exp"])
-        if exp > datetime.now():
-            days = (exp - datetime.now()).days
-            send(user_id, f"✅ اشتراكك فعال — باقي {days} يوم")
-            return
-
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "💳 اشتراك", "callback_data": "sub"}
-        ]]
-    }
-
-    send(user_id,
-        f"🎯 Sniper Signals\n\n"
-        f"💰 السعر: {PRICE_USD}$\n"
-        f"الدفع USDT TRC20\n\n"
-        f"اضغط للاشتراك",
-        keyboard
-    )
-
-def subscribe(user_id):
-    send(user_id,
-        f"💳 أرسل {PRICE_USD} USDT (TRC20)\n\n"
-        f"<code>{WALLET}</code>\n\n"
-        f"ثم أرسل TX HASH"
-    )
-
-def new_hash(user_id, tx):
-    db = load_db()
-
-    db["pending"][str(user_id)] = {
-        "tx": tx,
-        "time": datetime.now().isoformat()
-    }
-
-    save_db(db)
-
-    send(user_id, "⏳ بانتظار الموافقة")
-
-    admin = db.get("admin")
-    if admin:
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅", "callback_data": f"ok_{user_id}"},
-                {"text": "❌", "callback_data": f"no_{user_id}"}
-            ]]
-        }
-
-        send(admin, f"User {user_id}\n<code>{tx}</code>", keyboard)
-
-def approve(uid):
-    db = load_db()
-
-    if str(uid) not in db["pending"]:
-        return
-
-    link = create_invite()
-    if not link:
-        return
-
-    exp = (datetime.now() + timedelta(days=SUB_DAYS)).isoformat()
-
-    db["subs"][str(uid)] = {"exp": exp}
-    del db["pending"][str(uid)]
-
-    save_db(db)
-
-    send(uid, f"✅ تم التفعيل\n{link}")
-
-def reject(uid):
-    db = load_db()
-
-    if str(uid) in db["pending"]:
-        del db["pending"][str(uid)]
-        save_db(db)
-
-    send(uid, "❌ تم الرفض")
-
-# =========================
-# EXPIRY
-# =========================
-
-def checker():
-    while True:
-        db = load_db()
-        now = datetime.now()
-
-        changed = False
-
-        for uid, sub in list(db["subs"].items()):
-            if datetime.fromisoformat(sub["exp"]) < now:
-                kick(int(uid))
-                del db["subs"][uid]
-                changed = True
-
-        if changed:
-            save_db(db)
-
-        time.sleep(3600)
-
-# =========================
-# MAIN
-# =========================
 
 def main():
     offset = 0
 
-    threading.Thread(target=checker, daemon=True).start()
-
     while True:
-        try:
-            res = tg("getUpdates", {"offset": offset, "timeout": 30})
-            updates = res.get("result", [])
+        res = tg("getUpdates", {"offset": offset})
+        updates = res.get("result", [])
 
-            for u in updates:
-                offset = u["update_id"] + 1
+        for u in updates:
+            offset = u["update_id"] + 1
 
-                if "callback_query" in u:
-                    data = u["callback_query"]["data"]
-                    uid = u["callback_query"]["from"]["id"]
+            if "message" in u:
+                msg = u["message"]
+                uid = msg["from"]["id"]
+                text = msg.get("text", "")
 
-                    tg("answerCallbackQuery", {
-                        "callback_query_id": u["callback_query"]["id"]
-                    })
-
-                    if data == "sub":
-                        subscribe(uid)
-
-                    elif data.startswith("ok_"):
-                        approve(int(data.split("_")[1]))
-
-                    elif data.startswith("no_"):
-                        reject(int(data.split("_")[1]))
-
-                elif "message" in u:
-                    msg = u["message"]
-                    uid = msg["from"]["id"]
-                    text = msg.get("text", "")
-
-                    if text == "/start":
-                        start(uid)
-
-                    elif text == "/admin":
-                        db = load_db()
-                        db["admin"] = uid
-                        save_db(db)
-                        send(uid, "✅ أنت الأدمن")
-
-                    elif len(text) == 64:
-                        new_hash(uid, text)
-
-        except Exception as e:
-            print("ERROR:", e)
-            time.sleep(5)
+                if text == "/start":
+                    send(uid, "Bot is working ✅")
 
 if __name__ == "__main__":
     main()
