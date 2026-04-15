@@ -1,119 +1,61 @@
 import os
 import json
 import time
-import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- Configurations ---
+# --- الإعدادات الأساسية ---
 BOT_TOKEN   = "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA"
-CHANNEL_ID  = -1003976387571
 WALLET_USDT = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
 PRICE_USD   = 25
-SUB_DAYS    = 30
-DB_FILE     = "subscribers.json"
 BASE_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def load_db():
+# --- دوال الربط مع تليجرام ---
+def send_msg(chat_id, text):
+    url = f"{BASE_URL}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        if os.path.exists(DB_FILE):
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {"subscribers": {}, "pending": {}, "admin_id": None}
-    except:
-        return {"subscribers": {}, "pending": {}, "admin_id": None}
-
-def save_db(db):
-    try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(db, f, indent=2, ensure_ascii=False)
+        requests.post(url, json=payload, timeout=10)
     except:
         pass
 
-def tg(method, data={}):
+def get_updates(offset):
+    url = f"{BASE_URL}/getUpdates"
     try:
-        r = requests.post(f"{BASE_URL}/{method}", json=data, timeout=10)
-        return r.json()
+        r = requests.get(url, params={"offset": offset, "timeout": 20})
+        return r.json().get("result", [])
     except:
-        return {}
+        return []
 
-def send(chat_id, text, reply_markup=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup: data["reply_markup"] = reply_markup
-    return tg("sendMessage", data)
-
-# --- تم تعديل هذه الدالة لإزالة return المسببة للمشاكل ---
-def handle_start(user_id, username, first_name):
-    db = load_db()
-    sub = db["subscribers"].get(str(user_id))
-    active = False
-
-    if sub:
-        exp = datetime.fromisoformat(sub["expires"])
-        remaining = (exp - datetime.now()).days
-        if remaining > 0:
-            send(user_id, f"✅ Welcome back, {first_name}!\nYour subscription is active — expires in <b>{remaining} days</b>")
-            active = True
-
-    if not active:
-        msg = (
-            f"🎯 <b>Sniper Signals</b>\n"
-            f"The sharpest Futures alert bot on the market\n\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"💎 <b>What you get:</b>\n"
-            f"• Real-time OI + Funding alerts\n"
-            f"• Whale accumulation & distribution detection\n\n"
-            f"💰 Price: <b>${PRICE_USD} / month</b>\n"
-            f"💳 Payment: USDT TRC20\n\n"
-            f"Subscribe now 👇"
-        )
-        keyboard = {"inline_keyboard": [[{"text": "💳 Subscribe Now", "callback_data": "subscribe"}]]}
-        send(user_id, msg, keyboard)
-
-def handle_hash(user_id, username, first_name, tx_hash):
-    db = load_db()
-    db["pending"][str(user_id)] = {
-        "user_id": user_id, "username": username or "",
-        "first_name": first_name or "", "tx_hash": tx_hash,
-        "timestamp": datetime.now().isoformat()
-    }
-    save_db(db)
-    send(user_id, "⏳ Hash received! Verification in progress...")
-
-    admin_id = db.get("admin_id")
-    if admin_id:
-        keyboard = {"inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"approve_{user_id}"},
-            {"text": "❌ Reject", "callback_data": f"reject_{user_id}"}
-        ]]}
-        send(admin_id, f"🔔 <b>New Request</b>\nUser: {first_name}\nHash: <code>{tx_hash}</code>", keyboard)
-
-def main():
-    print("🎯 Bot is running...")
+# --- محرك البوت الرئيسي ---
+def start_bot():
+    print("🚀 Bot is starting...")
     offset = 0
+    
     while True:
-        try:
-            result = tg("getUpdates", {"offset": offset, "timeout": 20})
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-                if "message" in update:
-                    msg = update["message"]
-                    uid = msg["from"]["id"]
-                    text = msg.get("text", "").strip()
-                    if text == "/start":
-                        handle_start(uid, msg["from"].get("username"), msg["from"].get("first_name"))
-                    elif text == "/admin":
-                        db = load_db(); db["admin_id"] = uid; save_db(db)
-                        send(uid, "✅ Admin set.")
-                    elif len(text) == 64:
-                        handle_hash(uid, msg["from"].get("username"), msg["from"].get("first_name"), text)
-                elif "callback_query" in update:
-                    cb = update["callback_query"]
-                    if cb.get("data") == "subscribe":
-                        send(cb["from"]["id"], f"📋 Wallet Address:\n<code>{WALLET_USDT}</code>\n\nSend ${PRICE_USD} USDT TRC20 and paste hash here.")
-                    tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-        except:
-            time.sleep(2)
+        updates = get_updates(offset)
+        for update in updates:
+            offset = update["update_id"] + 1
+            
+            if "message" in update:
+                msg = update["message"]
+                uid = msg["from"]["id"]
+                text = msg.get("text", "")
+
+                if text == "/start":
+                    welcome_text = (
+                        f"🎯 <b>Sniper Signals Bot</b>\n\n"
+                        f"To subscribe, send <b>${PRICE_USD} USDT</b> (TRC20) to:\n"
+                        f"<code>{WALLET_USDT}</code>\n\n"
+                        f"After sending, paste the <b>TXID (Hash)</b> here."
+                    )
+                    send_msg(uid, welcome_text)
+                
+                elif len(text) == 64:
+                    send_msg(uid, "⏳ Your transaction hash is being verified. Please wait.")
+                    # هنا يمكنك إضافة كود لإرسال إشعار للأدمن إذا أردت
+        
+        time.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    start_bot()
