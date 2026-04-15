@@ -5,7 +5,7 @@ import threading
 import requests
 from datetime import datetime, timedelta
 
-# --- الإعدادات (Configurations) ---
+# --- Configurations ---
 BOT_TOKEN   = "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA"
 CHANNEL_ID  = -1003976387571
 WALLET_USDT = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
@@ -14,88 +14,61 @@ SUB_DAYS    = 30
 DB_FILE     = "subscribers.json"
 BASE_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --- إدارة قاعدة البيانات ---
 def load_db():
     try:
         if os.path.exists(DB_FILE):
             with open(DB_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {"subscribers": {}, "pending": {}, "admin_id": None}
-    except Exception as e:
-        print(f"Load DB Error: {e}")
+    except:
         return {"subscribers": {}, "pending": {}, "admin_id": None}
 
 def save_db(db):
     try:
         with open(DB_FILE, "w", encoding="utf-8") as f:
             json.dump(db, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Save DB Error: {e}")
+    except:
+        pass
 
-# --- وظائف تليجرام المساعدة ---
 def tg(method, data={}):
     try:
         r = requests.post(f"{BASE_URL}/{method}", json=data, timeout=10)
         return r.json()
-    except Exception as e:
-        print(f"TG Error: {e}")
+    except:
         return {}
 
 def send(chat_id, text, reply_markup=None):
     data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
+    if reply_markup: data["reply_markup"] = reply_markup
     return tg("sendMessage", data)
 
-def kick_user(user_id):
-    tg("banChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
-    tg("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
-
-def create_invite():
-    result = tg("createChatInviteLink", {
-        "chat_id": CHANNEL_ID,
-        "member_limit": 1,
-        "expire_date": int(time.time()) + 3600
-    })
-    return result.get("result", {}).get("invite_link")
-
-# --- منطق عمل البوت ---
+# --- تم تعديل هذه الدالة لإزالة return المسببة للمشاكل ---
 def handle_start(user_id, username, first_name):
     db = load_db()
     sub = db["subscribers"].get(str(user_id))
-    
+    active = False
+
     if sub:
         exp = datetime.fromisoformat(sub["expires"])
         remaining = (exp - datetime.now()).days
         if remaining > 0:
             send(user_id, f"✅ Welcome back, {first_name}!\nYour subscription is active — expires in <b>{remaining} days</b>")
-            return # تم التأكد من المحاذاة هنا لمنع خطأ السطر 59
+            active = True
 
-    msg = (
-        f"🎯 <b>Sniper Signals</b>\n"
-        f"The sharpest Futures alert bot on the market\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>What you get:</b>\n"
-        f"• Real-time OI + Funding alerts\n"
-        f"• Whale accumulation & distribution detection\n"
-        f"• 600+ Futures pairs covered\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"💰 Price: <b>${PRICE_USD} / month</b>\n"
-        f"💳 Payment: USDT TRC20\n\n"
-        f"Subscribe now 👇"
-    )
-    keyboard = {"inline_keyboard": [[{"text": "💳 Subscribe Now", "callback_data": "subscribe"}]]}
-    send(user_id, msg, keyboard)
-
-def handle_subscribe(user_id):
-    msg = (
-        f"💳 <b>Payment Instructions</b>\n\n"
-        f"Send <b>${PRICE_USD} USDT</b> on <b>TRC20</b>\n\n"
-        f"📋 Wallet Address:\n<code>{WALLET_USDT}</code>\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"After payment, send the <b>transaction hash</b> here."
-    )
-    send(user_id, msg)
+    if not active:
+        msg = (
+            f"🎯 <b>Sniper Signals</b>\n"
+            f"The sharpest Futures alert bot on the market\n\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💎 <b>What you get:</b>\n"
+            f"• Real-time OI + Funding alerts\n"
+            f"• Whale accumulation & distribution detection\n\n"
+            f"💰 Price: <b>${PRICE_USD} / month</b>\n"
+            f"💳 Payment: USDT TRC20\n\n"
+            f"Subscribe now 👇"
+        )
+        keyboard = {"inline_keyboard": [[{"text": "💳 Subscribe Now", "callback_data": "subscribe"}]]}
+        send(user_id, msg, keyboard)
 
 def handle_hash(user_id, username, first_name, tx_hash):
     db = load_db()
@@ -105,7 +78,7 @@ def handle_hash(user_id, username, first_name, tx_hash):
         "timestamp": datetime.now().isoformat()
     }
     save_db(db)
-    send(user_id, "⏳ Hash received! We will verify and activate your subscription shortly.")
+    send(user_id, "⏳ Hash received! Verification in progress...")
 
     admin_id = db.get("admin_id")
     if admin_id:
@@ -115,65 +88,32 @@ def handle_hash(user_id, username, first_name, tx_hash):
         ]]}
         send(admin_id, f"🔔 <b>New Request</b>\nUser: {first_name}\nHash: <code>{tx_hash}</code>", keyboard)
 
-def approve_user(user_id):
-    db = load_db()
-    pending = db["pending"].get(str(user_id))
-    if not pending: return False
-
-    invite = create_invite()
-    if not invite: return False
-
-    expires = (datetime.now() + timedelta(days=SUB_DAYS)).isoformat()
-    db["subscribers"][str(user_id)] = {
-        "user_id": user_id, "username": pending.get("username"),
-        "expires": expires, "joined": datetime.now().isoformat()
-    }
-    if str(user_id) in db["pending"]: del db["pending"][str(user_id)]
-    save_db(db)
-
-    send(user_id, f"🎯 <b>Activated!</b>\n\n🔗 Your link: {invite}\n📅 Expires: {expires[:10]}")
-    return True
-
-# --- الفحص الدوري لانتهاء الاشتراك ---
-def check_expired():
-    while True:
-        try:
-            db = load_db()
-            now = datetime.now()
-            expired = [uid for uid, sub in db["subscribers"].items() if datetime.fromisoformat(sub["expires"]) < now]
-            for uid in expired:
-                kick_user(int(uid))
-                send(int(uid), "⚠️ Subscription expired. /start to renew.")
-                del db["subscribers"][uid]
-            if expired: save_db(db)
-        except: pass
-        time.sleep(3600)
-
-# --- المحرك الرئيسي ---
 def main():
-    print("🎯 Bot Started...")
+    print("🎯 Bot is running...")
     offset = 0
-    threading.Thread(target=check_expired, daemon=True).start()
-
     while True:
         try:
             result = tg("getUpdates", {"offset": offset, "timeout": 20})
             for update in result.get("result", []):
                 offset = update["update_id"] + 1
-                
-                if "callback_query" in update:
-                    cb = update["callback_query"]
-                    from_id = cb["from"]["id"]
-                    data = cb.get("data", "")
-                    tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-                    
-                    if data == "subscribe": handle_subscribe(from_id)
-                    elif data.startswith("approve_"): approve_user(int(data.split("_")[1]))
-                
-                elif "message" in update:
+                if "message" in update:
                     msg = update["message"]
                     uid = msg["from"]["id"]
                     text = msg.get("text", "").strip()
-                    
                     if text == "/start":
-                        handle_start(uid, msg["
+                        handle_start(uid, msg["from"].get("username"), msg["from"].get("first_name"))
+                    elif text == "/admin":
+                        db = load_db(); db["admin_id"] = uid; save_db(db)
+                        send(uid, "✅ Admin set.")
+                    elif len(text) == 64:
+                        handle_hash(uid, msg["from"].get("username"), msg["from"].get("first_name"), text)
+                elif "callback_query" in update:
+                    cb = update["callback_query"]
+                    if cb.get("data") == "subscribe":
+                        send(cb["from"]["id"], f"📋 Wallet Address:\n<code>{WALLET_USDT}</code>\n\nSend ${PRICE_USD} USDT TRC20 and paste hash here.")
+                    tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
+        except:
+            time.sleep(2)
+
+if __name__ == "__main__":
+    main()
