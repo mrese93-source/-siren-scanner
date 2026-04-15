@@ -1,61 +1,73 @@
-import os
-import json
-import time
 import requests
-from datetime import datetime
+import time
 
-# --- الإعدادات الأساسية ---
-BOT_TOKEN   = "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA"
-WALLET_USDT = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
-PRICE_USD   = 25
-BASE_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# --- الإعدادات (ضع بياناتك هنا) ---
+TOKEN        = "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA"
+MY_WALLET    = "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr"
+CHANNEL_ID   = -1003976387571
+REQUIRED_USD = 25  # المبلغ المطلوب بالضبط
 
-# --- دوال الربط مع تليجرام ---
-def send_msg(chat_id, text):
-    url = f"{BASE_URL}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+URL = f"https://api.telegram.org/bot{TOKEN}/"
+
+# لمنع الاحتيال: سنخزن العمليات التي تم تفعيلها سابقاً في قائمة (يفضل لاحقاً وضعها في ملف)
+USED_TXS = []
+
+def check_tron_scan(tx_id):
+    """الفحص الآلي للعملية عبر شبكة ترون"""
     try:
-        requests.post(url, json=payload, timeout=10)
-    except:
-        pass
-
-def get_updates(offset):
-    url = f"{BASE_URL}/getUpdates"
-    try:
-        r = requests.get(url, params={"offset": offset, "timeout": 20})
-        return r.json().get("result", [])
-    except:
-        return []
-
-# --- محرك البوت الرئيسي ---
-def start_bot():
-    print("🚀 Bot is starting...")
-    offset = 0
-    
-    while True:
-        updates = get_updates(offset)
-        for update in updates:
-            offset = update["update_id"] + 1
-            
-            if "message" in update:
-                msg = update["message"]
-                uid = msg["from"]["id"]
-                text = msg.get("text", "")
-
-                if text == "/start":
-                    welcome_text = (
-                        f"🎯 <b>Sniper Signals Bot</b>\n\n"
-                        f"To subscribe, send <b>${PRICE_USD} USDT</b> (TRC20) to:\n"
-                        f"<code>{WALLET_USDT}</code>\n\n"
-                        f"After sending, paste the <b>TXID (Hash)</b> here."
-                    )
-                    send_msg(uid, welcome_text)
-                
-                elif len(text) == 64:
-                    send_msg(uid, "⏳ Your transaction hash is being verified. Please wait.")
-                    # هنا يمكنك إضافة كود لإرسال إشعار للأدمن إذا أردت
+        # فحص العملية عبر API مجاني (TronGrid)
+        api_url = f"https://api.trongrid.io/v1/transactions/{tx_id}/events"
+        response = requests.get(api_url, timeout=10).json()
         
+        if response.get('success') and response.get('data'):
+            for event in response['data']:
+                if event.get('event_name') == 'Transfer':
+                    result = event.get('result', {})
+                    # التأكد من المحفظة المستلمة والمبلغ (USDT يحتوي على 6 أصفار عشرياً)
+                    to_address = result.get('to')
+                    amount = int(result.get('value')) / 1_000_000
+                    
+                    if to_address == MY_WALLET and amount >= REQUIRED_USD:
+                        return True
+        return False
+    except:
+        return False
+
+def tg_call(method, data):
+    try: return requests.post(URL + method, json=data, timeout=15).json()
+    except: return None
+
+def main():
+    print("🤖 Automated Bot is Live...")
+    offset = 0
+    while True:
+        updates = tg_call("getUpdates", {"offset": offset, "timeout": 20})
+        if updates and "result" in updates:
+            for update in updates["result"]:
+                offset = update["update_id"] + 1
+                if "message" in update:
+                    msg = update["message"]
+                    uid = msg["chat"]["id"]
+                    text = msg.get("text", "").strip()
+
+                    if text == "/start":
+                        tg_call("sendMessage", {"chat_id": uid, "text": f"أهلاً بك!\nللاشتراك، أرسل {REQUIRED_USD}$ USDT (TRC20) للمحفظة:\n`{MY_WALLET}`\n\nثم أرسل الـ TXID هنا للفحص الآلي.", "parse_mode": "Markdown"})
+                    
+                    elif len(text) == 64:
+                        if text in USED_TXS:
+                            tg_call("sendMessage", {"chat_id": uid, "text": "❌ هذا الرمز تم استخدامه مسبقاً!"})
+                        else:
+                            tg_call("sendMessage", {"chat_id": uid, "text": "🔍 جاري فحص العملية على البلوكشين... انتظر لحظة."})
+                            if check_tron_scan(text):
+                                # توليد رابط لمرة واحدة فقط
+                                link_res = tg_call("createChatInviteLink", {"chat_id": CHANNEL_ID, "member_limit": 1})
+                                invite_link = link_res.get("result", {}).get("invite_link")
+                                
+                                USED_TXS.append(text) # تسجيل العملية كـ "مستخدمة" لمنع النصب
+                                tg_call("sendMessage", {"chat_id": uid, "text": f"✅ تم التأكد من الدفع! إليك رابط القناة (صالح لشخص واحد فقط):\n{invite_link}"})
+                            else:
+                                tg_call("sendMessage", {"chat_id": uid, "text": "❌ لم نجد عملية دفع مطابقة. تأكد من إرسال المبلغ الصحيح للمحفظة الصحيحة."})
         time.sleep(1)
 
 if __name__ == "__main__":
-    start_bot()
+    main()
