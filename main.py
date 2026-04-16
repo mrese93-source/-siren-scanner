@@ -3,13 +3,20 @@ import time
 import os
 import json
 
-TOKEN        = os.environ.get("SNIPER_TOKEN", "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA")
-MY_WALLET    = os.environ.get("MY_WALLET", "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr")
-CHANNEL_ID   = int(os.environ.get("CHANNEL_ID", "-1003976387571"))
-REQUIRED_USD = float(os.environ.get("REQUIRED_USD", "25"))
+TOKEN      = os.environ.get("SNIPER_TOKEN", "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA")
+MY_WALLET  = os.environ.get("MY_WALLET", "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003976387571"))
+
+PACKAGES = {
+    "weekly":  {"name": "Weekly",   "price": 15,  "label": "\U0001f4c5 Weekly \u2014 $15"},
+    "monthly": {"name": "Monthly",  "price": 40,  "label": "\U0001f4c6 Monthly \u2014 $40"},
+    "3months": {"name": "3 Months", "price": 99,  "label": "\U0001f5d3 3 Months \u2014 $99"},
+}
 
 USED_TXS_FILE = "used_txs.json"
 URL = f"https://api.telegram.org/bot{TOKEN}/"
+
+pending_package = {}
 
 
 def load_used_txs():
@@ -32,20 +39,16 @@ def save_used_tx(tx_id):
 USED_TXS = load_used_txs()
 
 
-def check_tron_scan(tx_id):
+def check_tron_scan(tx_id, required_usd):
     try:
         api_url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={tx_id}"
         response = requests.get(api_url, timeout=15).json()
-
         token_info = response.get("tokenTransferInfo")
         if not token_info:
             return False
-
         to_address = token_info.get("to_address", "")
-        amount_str = token_info.get("amount_str", "0")
-        amount = float(amount_str) / 1_000_000
-
-        if to_address == MY_WALLET and amount >= REQUIRED_USD:
+        amount = float(token_info.get("amount_str", "0")) / 1_000_000
+        if to_address == MY_WALLET and amount >= required_usd:
             return True
         return False
     except Exception as e:
@@ -60,53 +63,116 @@ def tg_call(method, data):
         return None
 
 
+def send_package_menu(uid):
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": PACKAGES["weekly"]["label"],  "callback_data": "pkg_weekly"}],
+            [{"text": PACKAGES["monthly"]["label"], "callback_data": "pkg_monthly"}],
+            [{"text": PACKAGES["3months"]["label"], "callback_data": "pkg_3months"}],
+        ]
+    }
+    tg_call("sendMessage", {
+        "chat_id": uid,
+        "text": (
+            "\U0001f4ca <b>Sniper Signals</b>\n\n"
+            "Real-time crypto signals for Bybit futures.\n\n"
+            "Choose your subscription plan:"
+        ),
+        "parse_mode": "HTML",
+        "reply_markup": keyboard,
+    })
+
+
+def send_payment_instructions(uid, pkg_key):
+    pkg = PACKAGES[pkg_key]
+    pending_package[uid] = pkg_key
+    tg_call("sendMessage", {
+        "chat_id": uid,
+        "text": (
+            f"\u2705 You selected: <b>{pkg['name']} \u2014 ${pkg['price']}</b>\n\n"
+            f"Send exactly <b>${pkg['price']} USDT</b> (TRC20 network) to:\n\n"
+            f"<code>{MY_WALLET}</code>\n\n"
+            f"\u261d\ufe0f Tap the address above to copy it.\n\n"
+            f"After sending, paste the <b>TXID</b> here to get instant access."
+        ),
+        "parse_mode": "HTML",
+    })
+
+
 def main():
     print("Bot is Live...", flush=True)
     offset = 0
     while True:
         updates = tg_call("getUpdates", {"offset": offset, "timeout": 20})
-        if updates and "result" in updates:
-            for update in updates["result"]:
-                offset = update["update_id"] + 1
-                if "message" not in update:
-                    continue
+        if not updates or "result" not in updates:
+            time.sleep(1)
+            continue
 
-                msg  = update["message"]
-                uid  = msg["chat"]["id"]
-                text = msg.get("text", "").strip()
+        for update in updates["result"]:
+            offset = update["update_id"] + 1
 
-                if text == "/start":
+            # --- Callback (button press) ---
+            if "callback_query" in update:
+                cq   = update["callback_query"]
+                uid  = cq["message"]["chat"]["id"]
+                data = cq.get("data", "")
+                tg_call("answerCallbackQuery", {"callback_query_id": cq["id"]})
+
+                if data.startswith("pkg_"):
+                    pkg_key = data[4:]
+                    if pkg_key in PACKAGES:
+                        send_payment_instructions(uid, pkg_key)
+                continue
+
+            # --- Message ---
+            if "message" not in update:
+                continue
+
+            msg  = update["message"]
+            uid  = msg["chat"]["id"]
+            text = msg.get("text", "").strip()
+
+            if text == "/start":
+                send_package_menu(uid)
+
+            elif len(text) == 64:
+                pkg_key = pending_package.get(uid)
+                if not pkg_key:
                     tg_call("sendMessage", {
                         "chat_id": uid,
-                        "text": (
-                            f"\u0623\u0647\u0644\u0627\u064b \u0628\u0643! \U0001f44b\n\n"
-                            f"\u0644\u0644\u0627\u0634\u062a\u0631\u0627\u0643 \u0641\u064a \u0642\u0646\u0627\u0629 \u0627\u0644\u0625\u0634\u0627\u0631\u0627\u062a\u060c \u0623\u0631\u0633\u0644 *{int(REQUIRED_USD)}$ USDT* (\u0634\u0628\u0643\u0629 TRC20) \u0644\u0644\u0645\u062d\u0641\u0638\u0629:\n"
-                            f"`{MY_WALLET}`\n\n"
-                            f"\u0628\u0639\u062f \u0627\u0644\u0625\u0631\u0633\u0627\u0644\u060c \u0623\u0631\u0633\u0644 *TXID* \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0647\u0646\u0627 \u0648\u0633\u064a\u062a\u0645 \u0627\u0644\u062a\u062d\u0642\u0642 \u062a\u0644\u0642\u0627\u0626\u064a\u0627\u064b \u2705"
-                        ),
-                        "parse_mode": "Markdown"
+                        "text": "Please choose a plan first by sending /start"
                     })
+                    continue
 
-                elif len(text) == 64:
-                    if text in USED_TXS:
-                        tg_call("sendMessage", {"chat_id": uid, "text": "\u274c \u0647\u0630\u0627 \u0627\u0644\u0631\u0645\u0632 \u062a\u0645 \u0627\u0633\u062a\u062e\u062f\u0627\u0645\u0647 \u0645\u0633\u0628\u0642\u0627\u064b!"})
-                    else:
-                        tg_call("sendMessage", {"chat_id": uid, "text": "\U0001f50d \u062c\u0627\u0631\u064a \u0641\u062d\u0635 \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0639\u0644\u0649 \u0627\u0644\u0628\u0644\u0648\u0643\u0634\u064a\u0646... \u0627\u0646\u062a\u0638\u0631 \u0644\u062d\u0638\u0629."})
-                        if check_tron_scan(text):
-                            link_res = tg_call("createChatInviteLink", {"chat_id": CHANNEL_ID, "member_limit": 1})
-                            invite_link = link_res.get("result", {}).get("invite_link") if link_res else None
-
-                            if invite_link:
-                                save_used_tx(text)
-                                USED_TXS.add(text)
-                                tg_call("sendMessage", {
-                                    "chat_id": uid,
-                                    "text": f"\u2705 \u062a\u0645 \u0627\u0644\u062a\u0623\u0643\u062f \u0645\u0646 \u0627\u0644\u062f\u0641\u0639!\n\n\u0631\u0627\u0628\u0637 \u0627\u0644\u0642\u0646\u0627\u0629 (\u0635\u0627\u0644\u062d \u0644\u0634\u062e\u0635 \u0648\u0627\u062d\u062f \u0641\u0642\u0637):\n{invite_link}"
-                                })
-                            else:
-                                tg_call("sendMessage", {"chat_id": uid, "text": "\u26a0\ufe0f \u062a\u0645 \u0627\u0644\u062a\u0623\u0643\u062f \u0645\u0646 \u0627\u0644\u062f\u0641\u0639 \u0644\u0643\u0646 \u062d\u0635\u0644 \u062e\u0637\u0623 \u0641\u064a \u0625\u0646\u0634\u0627\u0621 \u0627\u0644\u0631\u0627\u0628\u0637. \u062a\u0648\u0627\u0635\u0644 \u0645\u0639 \u0627\u0644\u062f\u0639\u0645."})
+                if text in USED_TXS:
+                    tg_call("sendMessage", {"chat_id": uid, "text": "\u274c This TXID has already been used."})
+                else:
+                    tg_call("sendMessage", {"chat_id": uid, "text": "\U0001f50d Checking transaction on blockchain..."})
+                    required = PACKAGES[pkg_key]["price"]
+                    if check_tron_scan(text, required):
+                        link_res = tg_call("createChatInviteLink", {"chat_id": CHANNEL_ID, "member_limit": 1})
+                        invite_link = link_res.get("result", {}).get("invite_link") if link_res else None
+                        if invite_link:
+                            save_used_tx(text)
+                            USED_TXS.add(text)
+                            pending_package.pop(uid, None)
+                            tg_call("sendMessage", {
+                                "chat_id": uid,
+                                "text": f"\u2705 Payment confirmed!\n\nHere is your channel link (single use):\n{invite_link}"
+                            })
                         else:
-                            tg_call("sendMessage", {"chat_id": uid, "text": "\u274c \u0644\u0645 \u0646\u062c\u062f \u0639\u0645\u0644\u064a\u0629 \u062f\u0641\u0639 \u0645\u0637\u0627\u0628\u0642\u0629.\n\n\u062a\u0623\u0643\u062f \u0645\u0646:\n- \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0635\u062d\u064a\u062d\n- \u0644\u0644\u0645\u062d\u0641\u0638\u0629 \u0627\u0644\u0635\u062d\u064a\u062d\u0629\n- \u0639\u0644\u0649 \u0634\u0628\u0643\u0629 TRC20"})
+                            tg_call("sendMessage", {"chat_id": uid, "text": "\u26a0\ufe0f Payment confirmed but failed to generate link. Please contact support."})
+                    else:
+                        tg_call("sendMessage", {
+                            "chat_id": uid,
+                            "text": (
+                                "\u274c Payment not found.\n\n"
+                                "Make sure you:\n"
+                                "\u2022 Sent the correct amount\n"
+                                "\u2022 To the correct wallet\n"
+                                "\u2022 On TRC20 network"
+                            )
+                        })
 
         time.sleep(1)
 
