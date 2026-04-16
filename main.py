@@ -8,9 +8,9 @@ MY_WALLET  = os.environ.get("MY_WALLET", "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003976387571"))
 
 PACKAGES = {
-    "weekly":  {"name": "Weekly",   "price": 15,  "label": "\U0001f4c5 Weekly \u2014 $15"},
-    "monthly": {"name": "Monthly",  "price": 40,  "label": "\U0001f4c6 Monthly \u2014 $40"},
-    "3months": {"name": "3 Months", "price": 99,  "label": "\U0001f5d3 3 Months \u2014 $99"},
+    "weekly":  {"name": "Weekly",   "price": 15, "label": "\U0001f4c5 Weekly \u2014 $15"},
+    "monthly": {"name": "Monthly",  "price": 30, "label": "\U0001f4c6 Monthly \u2014 $30"},
+    "3months": {"name": "3 Months", "price": 80, "label": "\U0001f5d3 3 Months \u2014 $80"},
 }
 
 USED_TXS_FILE = "used_txs.json"
@@ -111,20 +111,17 @@ def main():
         for update in updates["result"]:
             offset = update["update_id"] + 1
 
-            # --- Callback (button press) ---
             if "callback_query" in update:
                 cq   = update["callback_query"]
                 uid  = cq["message"]["chat"]["id"]
                 data = cq.get("data", "")
                 tg_call("answerCallbackQuery", {"callback_query_id": cq["id"]})
-
                 if data.startswith("pkg_"):
                     pkg_key = data[4:]
                     if pkg_key in PACKAGES:
                         send_payment_instructions(uid, pkg_key)
                 continue
 
-            # --- Message ---
             if "message" not in update:
                 continue
 
