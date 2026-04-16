@@ -75,7 +75,7 @@ def send_package_menu(uid):
         "chat_id": uid,
         "text": (
             "\U0001f4ca <b>Sniper Signals</b>\n\n"
-            "Real-time crypto signals for Bybit futures.\n\n"
+            "Real-time crypto signals.\n\n"
             "Choose your subscription plan:"
         ),
         "parse_mode": "HTML",
