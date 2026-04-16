@@ -954,15 +954,16 @@ def subscribe_symbols(ws, symbols):
     batch_size = 50
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i + batch_size]
-        topics = (
-            ["tickers."     + s for s in batch] +
-            ["liquidation." + s for s in batch]
-        )
         try:
-            ws.send(json.dumps({"op": "subscribe", "args": topics}))
+            ws.send(json.dumps({"op": "subscribe", "args": ["tickers." + s for s in batch]}))
         except Exception as e:
-            print(f"Subscribe batch error: {e}", flush=True)
-        time.sleep(0.25)
+            print(f"Subscribe tickers error: {e}", flush=True)
+        time.sleep(0.15)
+        try:
+            ws.send(json.dumps({"op": "subscribe", "args": ["liquidation." + s for s in batch]}))
+        except Exception as e:
+            print(f"Subscribe liquidation error: {e}", flush=True)
+        time.sleep(0.15)
 
 
 def resubscribe_loop():
