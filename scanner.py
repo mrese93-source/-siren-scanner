@@ -85,10 +85,11 @@ LIQ_ALERT_COOLDOWN_SEC    = 5 * 60
 
 # Liquidity zones
 LIQUIDITY_BAND_WIDTH_PCT  = 0.15     # cluster orderbook into 0.15% price bands
-LIQ_ZONE_MIN_DEPTH_USDT   = 500_000  # min $500K accumulated in a band
-LIQ_ZONE_APPROACH_PCT     = 0.3      # alert when price within 0.3% of zone
+LIQ_ZONE_MIN_DEPTH_USDT   = 1_500_000  # min $1.5M accumulated in a band
+LIQ_ZONE_APPROACH_PCT     = 0.15     # alert when price within 0.15% of zone
 LIQ_ZONE_COOLDOWN_SEC     = 60 * 60  # 1 hour between zone alerts per symbol
 STOP_HUNT_MIN_OI          = 500_000  # min OI required to run stop-hunt check
+LIQ_ZONE_MIN_OI           = 5_000_000 # min $5M OI to check orderbook zones
 
 # Compression (big move incoming)
 COMPRESSION_MAX_PCT       = 0.4
@@ -617,7 +618,13 @@ def check_liquidity_zones(symbol, price):
     if ts - last_liq_zone_alert.get(symbol, 0) < LIQ_ZONE_COOLDOWN_SEC:
         return
 
-    # --- 1. Deep orderbook clustering ---
+    with lock:
+        oi = symbol_metadata.get(symbol, {}).get("oi", 0)
+
+    # --- 1. Deep orderbook clustering (only high-OI symbols) ---
+    if oi < LIQ_ZONE_MIN_OI:
+        return
+
     ob = fetch_deep_orderbook(symbol)
     if ob:
         mid          = ob["mid"]
@@ -641,8 +648,6 @@ def check_liquidity_zones(symbol, price):
                 return
 
     # --- 2. Stop hunt zones (4h swing high/low) ---
-    with lock:
-        oi = symbol_metadata.get(symbol, {}).get("oi", 0)
     if oi < STOP_HUNT_MIN_OI:
         return
 
