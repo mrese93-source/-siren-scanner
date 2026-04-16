@@ -74,6 +74,25 @@ ACCUM_HISTORY_MIN = 4
 
 HTTP_TIMEOUT = 10
 
+# Whale detection
+WHALE_TRADE_MIN_USDT      = 50_000
+WHALE_ALERT_COOLDOWN_SEC  = 5 * 60
+
+# Liquidation cascade
+LIQ_WINDOW_SEC            = 60
+LIQ_MIN_USDT              = 100_000
+LIQ_ALERT_COOLDOWN_SEC    = 5 * 60
+
+# Liquidity zones
+LIQ_WALL_MIN_USDT         = 300_000
+LIQ_ZONE_APPROACH_PCT     = 0.5
+LIQ_ZONE_COOLDOWN_SEC     = 30 * 60
+
+# Compression (big move incoming)
+COMPRESSION_MAX_PCT       = 0.4
+COMPRESSION_OI_MIN        = 2.0
+COMPRESSION_COOLDOWN_SEC  = 2 * 60 * 60
+
 # =========================
 # State
 # =========================
@@ -96,6 +115,12 @@ orderbook_cache = {}
 
 last_price_cache = {}
 last_funding_seen = {}
+
+last_whale_alert      = {}
+liq_events            = defaultdict(list)
+last_liq_alert        = {}
+last_liq_zone_alert   = {}
+last_compression_alert = {}
 
 ws_app = None
 ws_lock = threading.Lock()
@@ -422,6 +447,175 @@ def send_funding_extreme_alert(symbol, funding, price):
     send_telegram(msg)
 
 
+def send_whale_alert(symbol, side, size_usdt, price):
+    direction = "🟢 BUY" if side == "Buy" else "🔴 SELL"
+    msg = (
+        f"🐋 <b>Whale Trade</b> — {direction}\n"
+        f"<b>{symbol}</b>\n\n"
+        f"💰 Size: <b>${round(size_usdt / 1_000, 1)}K</b>\n"
+        f"💵 Price: ${price}\n"
+    )
+    send_telegram(msg)
+
+
+def send_liquidation_alert(symbol, side, total_usdt, price):
+    direction = "🔴 Longs liquidated" if side == "Sell" else "🟢 Shorts liquidated"
+    msg = (
+        f"💥 <b>Liquidation Cascade</b>\n"
+        f"<b>{symbol}</b>\n\n"
+        f"{direction}\n"
+        f"💰 Total: <b>${round(total_usdt / 1_000, 1)}K</b> in 1 min\n"
+        f"💵 Price: ${price}\n"
+    )
+    send_telegram(msg)
+
+
+def send_liquidity_zone_alert(symbol, side, wall_price, wall_usdt, price):
+    zone_type = "🟢 Support" if side == "bid" else "🔴 Resistance"
+    msg = (
+        f"🧲 <b>Liquidity Zone</b> — {zone_type}\n"
+        f"<b>{symbol}</b>\n\n"
+        f"📍 Zone: <b>${wall_price}</b>\n"
+        f"💰 Liquidity: <b>${round(wall_usdt / 1_000_000, 2)}M</b>\n"
+        f"💵 Current Price: ${price}\n"
+    )
+    send_telegram(msg)
+
+
+def send_compression_alert(symbol, price, range_pct, oi_trend):
+    msg = (
+        f"🌀 <b>Compression — Big Move Coming</b>\n"
+        f"<b>{symbol}</b>\n\n"
+        f"📉 Price range (15m): <b>{round(range_pct, 2)}%</b> (very tight)\n"
+        f"📊 OI growing: <b>+{round(oi_trend, 2)}%</b>\n"
+        f"💵 Price: ${price}\n"
+        f"⚡ Explosive move expected soon"
+    )
+    send_telegram(msg)
+
+
+# =========================
+# Whale / Liquidation / Zones / Compression
+# =========================
+
+def check_whale_trades(symbol, price):
+    ts = now_ts()
+    if ts - last_whale_alert.get(symbol, 0) < WHALE_ALERT_COOLDOWN_SEC:
+        return
+    try:
+        url = f"https://api.bybit.com/v5/market/recent-trade?category=linear&symbol={symbol}&limit=50"
+        data = http_get_json(url, timeout=6)
+        if not data:
+            return
+        trades = data.get("result", {}).get("list", []) or []
+        for trade in trades:
+            size      = safe_float(trade.get("size", 0))
+            t_price   = safe_float(trade.get("price", 0))
+            size_usdt = size * t_price
+            if size_usdt >= WHALE_TRADE_MIN_USDT:
+                side = trade.get("side", "")
+                send_whale_alert(symbol, side, size_usdt, price)
+                last_whale_alert[symbol] = ts
+                print(f"WHALE: {symbol} {side} ${round(size_usdt/1000,1)}K", flush=True)
+                return
+    except Exception as e:
+        print(f"Whale check error {symbol}: {e}", flush=True)
+
+
+def process_liquidation(symbol, side, size_usdt, price):
+    ts = now_ts()
+    liq_events[symbol].append((ts, size_usdt, side))
+    liq_events[symbol] = [(t, v, s) for t, v, s in liq_events[symbol] if ts - t <= LIQ_WINDOW_SEC]
+
+    if ts - last_liq_alert.get(symbol, 0) < LIQ_ALERT_COOLDOWN_SEC:
+        return
+
+    long_liq  = sum(v for t, v, s in liq_events[symbol] if s == "Sell")
+    short_liq = sum(v for t, v, s in liq_events[symbol] if s == "Buy")
+
+    if long_liq >= LIQ_MIN_USDT:
+        send_liquidation_alert(symbol, "Sell", long_liq, price)
+        last_liq_alert[symbol] = ts
+        liq_events[symbol].clear()
+    elif short_liq >= LIQ_MIN_USDT:
+        send_liquidation_alert(symbol, "Buy", short_liq, price)
+        last_liq_alert[symbol] = ts
+        liq_events[symbol].clear()
+
+
+def check_liquidity_zones(symbol, price):
+    ts = now_ts()
+    if ts - last_liq_zone_alert.get(symbol, 0) < LIQ_ZONE_COOLDOWN_SEC:
+        return
+
+    obc = get_orderbook_cached(symbol)
+    if not obc.get("ok") or not obc.get("payload"):
+        return
+
+    payload = obc["payload"]
+
+    best_bid_wall, best_bid_price = 0.0, 0.0
+    for px_str, qty_str in payload["bids"]:
+        px, qty = safe_float(px_str), safe_float(qty_str)
+        wall_usdt = px * qty
+        if wall_usdt > best_bid_wall and px >= price * 0.98:
+            best_bid_wall, best_bid_price = wall_usdt, px
+
+    best_ask_wall, best_ask_price = 0.0, 0.0
+    for px_str, qty_str in payload["asks"]:
+        px, qty = safe_float(px_str), safe_float(qty_str)
+        wall_usdt = px * qty
+        if wall_usdt > best_ask_wall and px <= price * 1.02:
+            best_ask_wall, best_ask_price = wall_usdt, px
+
+    if best_bid_wall >= LIQ_WALL_MIN_USDT:
+        dist = abs(price - best_bid_price) / price * 100.0
+        if dist <= LIQ_ZONE_APPROACH_PCT:
+            send_liquidity_zone_alert(symbol, "bid", round(best_bid_price, 8), best_bid_wall, price)
+            last_liq_zone_alert[symbol] = ts
+            return
+
+    if best_ask_wall >= LIQ_WALL_MIN_USDT:
+        dist = abs(best_ask_price - price) / price * 100.0
+        if dist <= LIQ_ZONE_APPROACH_PCT:
+            send_liquidity_zone_alert(symbol, "ask", round(best_ask_price, 8), best_ask_wall, price)
+            last_liq_zone_alert[symbol] = ts
+
+
+def check_compression(symbol, price):
+    ts = now_ts()
+    if ts - last_compression_alert.get(symbol, 0) < COMPRESSION_COOLDOWN_SEC:
+        return
+
+    with lock:
+        prices_list = list(price_history[symbol])
+        oi_hist     = list(oi_history[symbol])
+
+    if len(prices_list) < 20 or len(oi_hist) < ACCUM_HISTORY_MIN:
+        return
+
+    cutoff = ts - 15 * 60
+    recent = [p for t, p in prices_list if t >= cutoff]
+    if len(recent) < 5:
+        return
+
+    high, low = max(recent), min(recent)
+    if low <= 0:
+        return
+    range_pct = (high - low) / low * 100.0
+
+    if range_pct > COMPRESSION_MAX_PCT:
+        return
+
+    oi_trend = calc_trend(oi_hist)
+    if oi_trend < COMPRESSION_OI_MIN:
+        return
+
+    send_compression_alert(symbol, price, range_pct, oi_trend)
+    last_compression_alert[symbol] = ts
+    print(f"COMPRESSION: {symbol} range={round(range_pct,2)}% OI={round(oi_trend,2)}%", flush=True)
+
+
 # =========================
 # Metadata updater
 # =========================
@@ -711,6 +905,7 @@ def check_signals(symbol, price):
         is_short = change_1m < 0 and change_3m < 0
 
         if is_long or is_short:
+            check_whale_trades(symbol, price)
             send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score)
             with lock:
                 last_fast_alert[symbol] = ts
@@ -723,9 +918,12 @@ def check_signals(symbol, price):
     )
 
     if slow_trigger and not slow_blocked:
+        check_whale_trades(symbol, price)
         send_slow_alert(symbol, price, change_15m, change_1h, change_24h)
         with lock:
             last_slow_alert[symbol] = ts
+
+    check_liquidity_zones(symbol, price)
 
 
 # =========================
@@ -756,7 +954,10 @@ def subscribe_symbols(ws, symbols):
     batch_size = 50
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i + batch_size]
-        topics = ["tickers." + s for s in batch]
+        topics = (
+            ["tickers."     + s for s in batch] +
+            ["liquidation." + s for s in batch]
+        )
         try:
             ws.send(json.dumps({"op": "subscribe", "args": topics}))
         except Exception as e:
@@ -796,12 +997,26 @@ def on_message(ws, message):
         data = json.loads(message)
         topic = data.get("topic", "")
 
+        # --- Liquidation stream ---
+        if topic.startswith("liquidation."):
+            liq_data  = data.get("data") or {}
+            symbol    = liq_data.get("symbol") or ""
+            side      = liq_data.get("side", "")
+            size      = safe_float(liq_data.get("size", 0))
+            liq_price = safe_float(liq_data.get("price", 0))
+            if symbol and size > 0 and liq_price > 0:
+                with lock:
+                    price = last_price_cache.get(symbol, liq_price)
+                process_liquidation(symbol, side, size * liq_price, price)
+            return
+
         if not topic.startswith("tickers."):
             return
 
+        # --- Ticker stream ---
         ticker_data = data.get("data") or {}
-        symbol = ticker_data.get("symbol") or ""
-        last_price = safe_float(ticker_data.get("lastPrice", 0))
+        symbol      = ticker_data.get("symbol") or ""
+        last_price  = safe_float(ticker_data.get("lastPrice", 0))
         print(symbol, last_price, flush=True)
 
         if not symbol or last_price <= 0:
@@ -816,6 +1031,7 @@ def on_message(ws, message):
         maybe_send_funding_alert(symbol, funding, last_price)
         check_signals(symbol, last_price)
         check_accumulation(symbol, last_price)
+        check_compression(symbol, last_price)
 
     except Exception as e:
         print(f"Message error: {e}", flush=True)
