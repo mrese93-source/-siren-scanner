@@ -75,19 +75,19 @@ def main():
                     tg_call("sendMessage", {
                         "chat_id": uid,
                         "text": (
-                            f"أهلاً بك! 👋\n\n"
-                            f"للاشتراك أرسل *{int(REQUIRED_USD)}$ USDT* (شبكة TRC20) للمحفظة:\n"
+                            f"Welcome! 👋\n\n"
+                            f"To subscribe, send *{int(REQUIRED_USD)}$ USDT* (TRC20 network) to:\n"
                             f"`{MY_WALLET}`\n\n"
-                            f"بعد الإرسال، أرسل *TXID* العملية هنا وسيتم التحقق تلقائياً ✅"
+                            f"After sending, paste the *TXID* here and it will be verified automatically ✅"
                         ),
                         "parse_mode": "Markdown"
                     })
 
                 elif len(text) == 64:
                     if text in USED_TXS:
-                        tg_call("sendMessage", {"chat_id": uid, "text": "❌ هذا الرمز تم استخدامه مسبقاً!"})
+                        tg_call("sendMessage", {"chat_id": uid, "text": "❌ This TXID has already been used!"})
                     else:
-                        tg_call("sendMessage", {"chat_id": uid, "text": "🔍 جاري فحص العملية... انتظر لحظة."})
+                        tg_call("sendMessage", {"chat_id": uid, "text": "🔍 Checking transaction... please wait."})
                         if check_tron_scan(text):
                             link_res = tg_call("createChatInviteLink", {"chat_id": CHANNEL_ID, "member_limit": 1})
                             invite_link = link_res.get("result", {}).get("invite_link") if link_res else None
@@ -96,12 +96,12 @@ def main():
                                 USED_TXS.add(text)
                                 tg_call("sendMessage", {
                                     "chat_id": uid,
-                                    "text": f"✅ تم التأكد من الدفع!\n\nرابط القناة:\n{invite_link}"
+                                    "text": f"✅ Payment confirmed!\n\nHere is your channel link:\n{invite_link}"
                                 })
                             else:
-                                tg_call("sendMessage", {"chat_id": uid, "text": "⚠️ تم التأكد من الدفع لكن حصل خطأ في الرابط. تواصل مع الدعم."})
+                                tg_call("sendMessage", {"chat_id": uid, "text": "⚠️ Payment confirmed but failed to generate link. Please contact support."})
                         else:
-                            tg_call("sendMessage", {"chat_id": uid, "text": "❌ لم نجد عملية دفع مطابقة.\n\nتأكد من:\n- المبلغ الصحيح\n- المحفظة الصحيحة\n- شبكة TRC20"})
+                            tg_call("sendMessage", {"chat_id": uid, "text": "❌ Payment not found.\n\nMake sure you:\n- Sent the correct amount\n- To the correct wallet\n- On TRC20 network"})
 
         time.sleep(1)
 
