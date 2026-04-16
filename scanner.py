@@ -84,9 +84,11 @@ LIQ_MIN_USDT              = 100_000
 LIQ_ALERT_COOLDOWN_SEC    = 5 * 60
 
 # Liquidity zones
-LIQ_WALL_MIN_USDT         = 300_000
-LIQ_ZONE_APPROACH_PCT     = 0.5
-LIQ_ZONE_COOLDOWN_SEC     = 30 * 60
+LIQUIDITY_BAND_WIDTH_PCT  = 0.15     # cluster orderbook into 0.15% price bands
+LIQ_ZONE_MIN_DEPTH_USDT   = 500_000  # min $500K accumulated in a band
+LIQ_ZONE_APPROACH_PCT     = 0.3      # alert when price within 0.3% of zone
+LIQ_ZONE_COOLDOWN_SEC     = 60 * 60  # 1 hour between zone alerts per symbol
+STOP_HUNT_MIN_OI          = 500_000  # min OI required to run stop-hunt check
 
 # Compression (big move incoming)
 COMPRESSION_MAX_PCT       = 0.4
@@ -470,14 +472,31 @@ def send_liquidation_alert(symbol, side, total_usdt, price):
     send_telegram(msg)
 
 
-def send_liquidity_zone_alert(symbol, side, wall_price, wall_usdt, price):
-    zone_type = "🟢 Support" if side == "bid" else "🔴 Resistance"
+def send_liquidity_zone_alert(symbol, side, zone_price, depth_usdt, price):
+    zone_type = "🟢 Bid Cluster (Support)" if side == "bid" else "🔴 Ask Cluster (Resistance)"
     msg = (
         f"🧲 <b>Liquidity Zone</b> — {zone_type}\n"
         f"<b>{symbol}</b>\n\n"
-        f"📍 Zone: <b>${wall_price}</b>\n"
-        f"💰 Liquidity: <b>${round(wall_usdt / 1_000_000, 2)}M</b>\n"
+        f"📍 Zone: <b>${zone_price}</b>\n"
+        f"💰 Depth: <b>${round(depth_usdt / 1_000_000, 2)}M</b>\n"
         f"💵 Current Price: ${price}\n"
+    )
+    send_telegram(msg)
+
+
+def send_stop_hunt_alert(symbol, level_type, level_price, price):
+    if level_type == "high":
+        txt = "🎯 Approaching Swing HIGH — Stop Hunt Risk"
+        note = "Shorts stops stacked above this level"
+    else:
+        txt = "🎯 Approaching Swing LOW — Stop Hunt Risk"
+        note = "Longs stops stacked below this level"
+    msg = (
+        f"{txt}\n"
+        f"<b>{symbol}</b>\n\n"
+        f"📍 Level: <b>${level_price}</b>\n"
+        f"💵 Current Price: ${price}\n"
+        f"⚠️ {note}"
     )
     send_telegram(msg)
 
@@ -543,42 +562,101 @@ def process_liquidation(symbol, side, size_usdt, price):
         liq_events[symbol].clear()
 
 
+def fetch_deep_orderbook(symbol):
+    url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit=200"
+    data = http_get_json(url, timeout=8)
+    if not data:
+        return None
+    result = data.get("result", {}) or {}
+    bids = result.get("b", []) or []
+    asks = result.get("a", []) or []
+    if not bids or not asks:
+        return None
+    mid = (safe_float(bids[0][0]) + safe_float(asks[0][0])) / 2.0
+    if mid <= 0:
+        return None
+    return {"mid": mid, "bids": bids, "asks": asks}
+
+
+def find_liquidity_clusters(orders, band_width_pct, mid):
+    band_abs = mid * band_width_pct / 100.0
+    if band_abs <= 0:
+        return []
+    bands = defaultdict(float)
+    for px_str, qty_str in orders:
+        px  = safe_float(px_str)
+        qty = safe_float(qty_str)
+        if px <= 0 or qty <= 0:
+            continue
+        idx = int(px / band_abs)
+        bands[idx] += px * qty
+    clusters = [((idx + 0.5) * band_abs, depth) for idx, depth in bands.items()]
+    clusters.sort(key=lambda x: x[1], reverse=True)
+    return clusters
+
+
+def fetch_swing_levels(symbol):
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=240&limit=30"
+    data = http_get_json(url, timeout=8)
+    if not data:
+        return None, None
+    try:
+        candles = data.get("result", {}).get("list", []) or []
+        highs = [safe_float(c[2]) for c in candles[1:15] if len(c) > 3]
+        lows  = [safe_float(c[3]) for c in candles[1:15] if len(c) > 3]
+        if not highs or not lows:
+            return None, None
+        return max(highs), min(lows)
+    except Exception as e:
+        print(f"Swing levels error {symbol}: {e}", flush=True)
+        return None, None
+
+
 def check_liquidity_zones(symbol, price):
     ts = now_ts()
     if ts - last_liq_zone_alert.get(symbol, 0) < LIQ_ZONE_COOLDOWN_SEC:
         return
 
-    obc = get_orderbook_cached(symbol)
-    if not obc.get("ok") or not obc.get("payload"):
+    # --- 1. Deep orderbook clustering ---
+    ob = fetch_deep_orderbook(symbol)
+    if ob:
+        mid          = ob["mid"]
+        bid_clusters = find_liquidity_clusters(ob["bids"], LIQUIDITY_BAND_WIDTH_PCT, mid)
+        ask_clusters = find_liquidity_clusters(ob["asks"], LIQUIDITY_BAND_WIDTH_PCT, mid)
+
+        for zone_price, depth in bid_clusters[:5]:
+            if depth < LIQ_ZONE_MIN_DEPTH_USDT:
+                break
+            if abs(price - zone_price) / price * 100.0 <= LIQ_ZONE_APPROACH_PCT:
+                send_liquidity_zone_alert(symbol, "bid", round(zone_price, 8), depth, price)
+                last_liq_zone_alert[symbol] = ts
+                return
+
+        for zone_price, depth in ask_clusters[:5]:
+            if depth < LIQ_ZONE_MIN_DEPTH_USDT:
+                break
+            if abs(zone_price - price) / price * 100.0 <= LIQ_ZONE_APPROACH_PCT:
+                send_liquidity_zone_alert(symbol, "ask", round(zone_price, 8), depth, price)
+                last_liq_zone_alert[symbol] = ts
+                return
+
+    # --- 2. Stop hunt zones (4h swing high/low) ---
+    with lock:
+        oi = symbol_metadata.get(symbol, {}).get("oi", 0)
+    if oi < STOP_HUNT_MIN_OI:
         return
 
-    payload = obc["payload"]
+    swing_high, swing_low = fetch_swing_levels(symbol)
 
-    best_bid_wall, best_bid_price = 0.0, 0.0
-    for px_str, qty_str in payload["bids"]:
-        px, qty = safe_float(px_str), safe_float(qty_str)
-        wall_usdt = px * qty
-        if wall_usdt > best_bid_wall and px >= price * 0.98:
-            best_bid_wall, best_bid_price = wall_usdt, px
-
-    best_ask_wall, best_ask_price = 0.0, 0.0
-    for px_str, qty_str in payload["asks"]:
-        px, qty = safe_float(px_str), safe_float(qty_str)
-        wall_usdt = px * qty
-        if wall_usdt > best_ask_wall and px <= price * 1.02:
-            best_ask_wall, best_ask_price = wall_usdt, px
-
-    if best_bid_wall >= LIQ_WALL_MIN_USDT:
-        dist = abs(price - best_bid_price) / price * 100.0
-        if dist <= LIQ_ZONE_APPROACH_PCT:
-            send_liquidity_zone_alert(symbol, "bid", round(best_bid_price, 8), best_bid_wall, price)
+    if swing_high and swing_high > price:
+        if (swing_high - price) / price * 100.0 <= LIQ_ZONE_APPROACH_PCT:
+            send_stop_hunt_alert(symbol, "high", round(swing_high, 8), price)
             last_liq_zone_alert[symbol] = ts
             return
 
-    if best_ask_wall >= LIQ_WALL_MIN_USDT:
-        dist = abs(best_ask_price - price) / price * 100.0
-        if dist <= LIQ_ZONE_APPROACH_PCT:
-            send_liquidity_zone_alert(symbol, "ask", round(best_ask_price, 8), best_ask_wall, price)
+    if swing_low and swing_low < price:
+        if (price - swing_low) / price * 100.0 <= LIQ_ZONE_APPROACH_PCT:
+            send_stop_hunt_alert(symbol, "low", round(swing_low, 8), price)
             last_liq_zone_alert[symbol] = ts
 
 
