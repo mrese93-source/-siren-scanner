@@ -479,7 +479,7 @@ def send_liquidation_alert(symbol, side, total_usdt, price):
     send_telegram(msg)
 
 
-def send_structural_zone_alert(symbol, zone_type, zone_price, weight, touches, ob_depth, price):
+def send_structural_zone_alert(symbol, zone_type, zone_price, weight, w_touches, d_touches, ob_depth, price):
     icon     = "🟢" if zone_type == "support" else "🔴"
     type_txt = "Support" if zone_type == "support" else "Resistance"
     strength = "🔥🔥🔥 Major" if weight >= 6 else ("🔥🔥 Strong" if weight >= 3 else "🔥 Moderate")
@@ -487,7 +487,7 @@ def send_structural_zone_alert(symbol, zone_type, zone_price, weight, touches, o
         f"📍 <b>Structural Zone — {icon} {type_txt}</b>\n"
         f"<b>{symbol}</b>\n\n"
         f"📊 Zone: <b>${zone_price}</b>\n"
-        f"🔄 Touches: <b>{touches}x</b>\n"
+        f"🗓 Weekly touches: <b>{w_touches}x</b> | Daily: <b>{d_touches}x</b>\n"
         f"💰 Orders at level: <b>${round(ob_depth / 1_000, 0)}K</b>\n"
         f"{strength}\n"
         f"💵 Current Price: ${price}\n"
@@ -630,8 +630,9 @@ def fetch_wick_zones(symbol):
 
 def cluster_swing_zones(raw_levels):
     """
-    Merge nearby swing levels (within ZONE_CLUSTER_PCT%) into zones.
-    Returns list of (avg_price, total_weight, touch_count, dominant_type) sorted by weight desc.
+    Merge nearby levels (within ZONE_CLUSTER_PCT%) into zones.
+    Returns list of (avg_price, total_weight, weekly_touches, daily_touches, dominant_type).
+    Only zones confirmed on BOTH weekly AND daily are considered structural.
     """
     if not raw_levels:
         return []
@@ -643,18 +644,22 @@ def cluster_swing_zones(raw_levels):
         if ref > 0 and abs(price - ref) / ref * 100.0 <= ZONE_CLUSTER_PCT:
             current.append((price, weight, ptype))
         else:
-            avg   = sum(p for p, w, t in current) / len(current)
-            total = sum(w for p, w, t in current)
-            highs = sum(1 for p, w, t in current if t == "high")
-            lows  = sum(1 for p, w, t in current if t == "low")
-            clusters.append((avg, total, len(current), "high" if highs >= lows else "low"))
+            avg     = sum(p for p, w, t in current) / len(current)
+            total   = sum(w for p, w, t in current)
+            w_touch = sum(1 for p, w, t in current if w == ZONE_WEEKLY_WEIGHT)
+            d_touch = sum(1 for p, w, t in current if w == ZONE_DAILY_WEIGHT)
+            highs   = sum(1 for p, w, t in current if t == "high")
+            lows    = sum(1 for p, w, t in current if t == "low")
+            clusters.append((avg, total, w_touch, d_touch, "high" if highs >= lows else "low"))
             current = [(price, weight, ptype)]
     if current:
-        avg   = sum(p for p, w, t in current) / len(current)
-        total = sum(w for p, w, t in current)
-        highs = sum(1 for p, w, t in current if t == "high")
-        lows  = sum(1 for p, w, t in current if t == "low")
-        clusters.append((avg, total, len(current), "high" if highs >= lows else "low"))
+        avg     = sum(p for p, w, t in current) / len(current)
+        total   = sum(w for p, w, t in current)
+        w_touch = sum(1 for p, w, t in current if w == ZONE_WEEKLY_WEIGHT)
+        d_touch = sum(1 for p, w, t in current if w == ZONE_DAILY_WEIGHT)
+        highs   = sum(1 for p, w, t in current if t == "high")
+        lows    = sum(1 for p, w, t in current if t == "low")
+        clusters.append((avg, total, w_touch, d_touch, "high" if highs >= lows else "low"))
     clusters.sort(key=lambda x: x[1], reverse=True)
     return clusters
 
@@ -712,8 +717,9 @@ def check_liquidity_zones(symbol, price):
     if not zones:
         return
 
-    for zone_price, weight, touches, zone_kind in zones:
-        if touches < 2:
+    for zone_price, weight, w_touches, d_touches, zone_kind in zones:
+        # Zone must be confirmed on BOTH weekly AND daily
+        if w_touches < 1 or d_touches < 1:
             continue
 
         dist = abs(price - zone_price) / price * 100.0
@@ -729,12 +735,12 @@ def check_liquidity_zones(symbol, price):
         decimals  = max(0, 6 - len(str(int(zone_price))))
         send_structural_zone_alert(
             symbol, zone_type, round(zone_price, decimals),
-            weight, touches, ob_depth, price
+            weight, w_touches, d_touches, ob_depth, price
         )
         last_liq_zone_alert[symbol] = ts
         print(
             f"ZONE: {symbol} {zone_type} ${zone_price:.4f} "
-            f"depth=${round(ob_depth / 1_000, 0)}K weight={weight}",
+            f"W={w_touches} D={d_touches} depth=${round(ob_depth / 1_000, 0)}K",
             flush=True,
         )
         return
