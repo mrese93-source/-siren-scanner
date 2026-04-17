@@ -966,6 +966,8 @@ def check_signals(symbol, price):
     with lock:
         last_slow = last_slow_alert.get(symbol)
 
+    slow_blocked = (last_slow is not None) and (ts - last_slow < SLOW_ANTI_SPAM_SEC)
+
     with lock:
         prices_list = list(price_history[symbol])
         meta = symbol_metadata.get(symbol, {}).copy()
