@@ -1068,7 +1068,10 @@ def check_signals(symbol, price):
         if direction:
             with lock:
                 last_dir = last_fast_alert.get((symbol, direction), 0)
-            if ts - last_dir >= FAST_ANTI_SPAM_SEC:
+            elapsed = ts - last_dir
+            strong_move = abs(change_1m) >= 3.0
+            cooldown = 5 * 60 if strong_move else FAST_ANTI_SPAM_SEC
+            if elapsed >= cooldown:
                 check_whale_trades(symbol, price)
                 send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score)
                 with lock:
