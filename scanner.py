@@ -713,6 +713,9 @@ def check_liquidity_zones(symbol, price):
         return
 
     for zone_price, weight, touches, zone_kind in zones:
+        if touches < 2:
+            continue
+
         dist = abs(price - zone_price) / price * 100.0
         if dist > ZONE_APPROACH_PCT:
             continue
