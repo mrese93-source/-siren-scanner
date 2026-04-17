@@ -13,11 +13,12 @@ PACKAGES = {
     "3months": {"name": "3 Months", "price": 80, "label": "\U0001f5d3 3 Months \u2014 $80"},
 }
 
-USED_TXS_FILE   = "used_txs.json"
-USED_TRIAL_FILE = "used_trials.json"
+USED_TXS_FILE    = "used_txs.json"
+USED_TRIAL_FILE  = "used_trials.json"
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-pending_package = {}
+pending_package  = {}
+pending_trial    = set()
 
 
 def load_json_set(filepath):
@@ -98,11 +99,34 @@ def send_payment_instructions(uid, pkg_key):
     })
 
 
-def handle_trial(uid):
-    if uid in USED_TRIAL:
+def request_phone(uid):
+    pending_trial.add(uid)
+    keyboard = {
+        "keyboard": [[{
+            "text": "\U0001f4f2 Share my phone number",
+            "request_contact": True
+        }]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+    tg_call("sendMessage", {
+        "chat_id": uid,
+        "text": (
+            "\U0001f381 <b>Free 24h Trial</b>\n\n"
+            "To activate your trial, please share your phone number.\n"
+            "This is to prevent abuse (one trial per person)."
+        ),
+        "parse_mode": "HTML",
+        "reply_markup": keyboard,
+    })
+
+
+def give_trial(uid, phone):
+    if phone in USED_TRIAL:
         tg_call("sendMessage", {
             "chat_id": uid,
-            "text": "\u274c You have already used your free trial."
+            "text": "\u274c This phone number has already used the free trial.",
+            "reply_markup": {"remove_keyboard": True}
         })
         return
 
@@ -114,20 +138,24 @@ def handle_trial(uid):
     invite_link = link_res.get("result", {}).get("invite_link") if link_res else None
 
     if invite_link:
-        USED_TRIAL.add(uid)
+        USED_TRIAL.add(phone)
         save_json_set(USED_TRIAL_FILE, USED_TRIAL)
         tg_call("sendMessage", {
             "chat_id": uid,
             "text": (
                 "\U0001f381 <b>Your free 24h trial is ready!</b>\n\n"
                 f"{invite_link}\n\n"
-                "\u23f0 This link expires in 24 hours.\n"
-                "After the trial, subscribe to keep access."
+                "\u23f0 Expires in 24 hours."
             ),
             "parse_mode": "HTML",
+            "reply_markup": {"remove_keyboard": True}
         })
     else:
-        tg_call("sendMessage", {"chat_id": uid, "text": "\u26a0\ufe0f Could not generate trial link. Please try again later."})
+        tg_call("sendMessage", {
+            "chat_id": uid,
+            "text": "\u26a0\ufe0f Could not generate trial link. Please try again later.",
+            "reply_markup": {"remove_keyboard": True}
+        })
 
 
 def main():
@@ -147,9 +175,8 @@ def main():
                 uid  = cq["message"]["chat"]["id"]
                 data = cq.get("data", "")
                 tg_call("answerCallbackQuery", {"callback_query_id": cq["id"]})
-
                 if data == "trial":
-                    handle_trial(uid)
+                    request_phone(uid)
                 elif data.startswith("pkg_"):
                     pkg_key = data[4:]
                     if pkg_key in PACKAGES:
@@ -161,6 +188,14 @@ def main():
 
             msg  = update["message"]
             uid  = msg["chat"]["id"]
+
+            # Handle phone number sharing
+            if "contact" in msg and uid in pending_trial:
+                phone = msg["contact"].get("phone_number", "")
+                pending_trial.discard(uid)
+                give_trial(uid, phone)
+                continue
+
             text = msg.get("text", "").strip()
 
             if text == "/start":
