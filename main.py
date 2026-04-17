@@ -13,30 +13,30 @@ PACKAGES = {
     "3months": {"name": "3 Months", "price": 80, "label": "\U0001f5d3 3 Months \u2014 $80"},
 }
 
-USED_TXS_FILE = "used_txs.json"
+USED_TXS_FILE   = "used_txs.json"
+USED_TRIAL_FILE = "used_trials.json"
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 pending_package = {}
 
 
-def load_used_txs():
-    if os.path.exists(USED_TXS_FILE):
+def load_json_set(filepath):
+    if os.path.exists(filepath):
         try:
-            with open(USED_TXS_FILE, "r") as f:
+            with open(filepath, "r") as f:
                 return set(json.load(f))
         except Exception:
             return set()
     return set()
 
 
-def save_used_tx(tx_id):
-    txs = load_used_txs()
-    txs.add(tx_id)
-    with open(USED_TXS_FILE, "w") as f:
-        json.dump(list(txs), f)
+def save_json_set(filepath, data_set):
+    with open(filepath, "w") as f:
+        json.dump(list(data_set), f)
 
 
-USED_TXS = load_used_txs()
+USED_TXS   = load_json_set(USED_TXS_FILE)
+USED_TRIAL = load_json_set(USED_TRIAL_FILE)
 
 
 def check_tron_scan(tx_id, required_usd):
@@ -48,9 +48,7 @@ def check_tron_scan(tx_id, required_usd):
             return False
         to_address = token_info.get("to_address", "")
         amount = float(token_info.get("amount_str", "0")) / 1_000_000
-        if to_address == MY_WALLET and amount >= required_usd:
-            return True
-        return False
+        return to_address == MY_WALLET and amount >= required_usd
     except Exception as e:
         print(f"TronScan error: {e}", flush=True)
         return False
@@ -66,6 +64,7 @@ def tg_call(method, data):
 def send_package_menu(uid):
     keyboard = {
         "inline_keyboard": [
+            [{"text": "\U0001f381 Free 24h Trial", "callback_data": "trial"}],
             [{"text": PACKAGES["weekly"]["label"],  "callback_data": "pkg_weekly"}],
             [{"text": PACKAGES["monthly"]["label"], "callback_data": "pkg_monthly"}],
             [{"text": PACKAGES["3months"]["label"], "callback_data": "pkg_3months"}],
@@ -99,6 +98,38 @@ def send_payment_instructions(uid, pkg_key):
     })
 
 
+def handle_trial(uid):
+    if uid in USED_TRIAL:
+        tg_call("sendMessage", {
+            "chat_id": uid,
+            "text": "\u274c You have already used your free trial."
+        })
+        return
+
+    link_res = tg_call("createChatInviteLink", {
+        "chat_id": CHANNEL_ID,
+        "member_limit": 1,
+        "expire_date": int(time.time()) + 86400
+    })
+    invite_link = link_res.get("result", {}).get("invite_link") if link_res else None
+
+    if invite_link:
+        USED_TRIAL.add(uid)
+        save_json_set(USED_TRIAL_FILE, USED_TRIAL)
+        tg_call("sendMessage", {
+            "chat_id": uid,
+            "text": (
+                "\U0001f381 <b>Your free 24h trial is ready!</b>\n\n"
+                f"{invite_link}\n\n"
+                "\u23f0 This link expires in 24 hours.\n"
+                "After the trial, subscribe to keep access."
+            ),
+            "parse_mode": "HTML",
+        })
+    else:
+        tg_call("sendMessage", {"chat_id": uid, "text": "\u26a0\ufe0f Could not generate trial link. Please try again later."})
+
+
 def main():
     print("Bot is Live...", flush=True)
     offset = 0
@@ -116,7 +147,10 @@ def main():
                 uid  = cq["message"]["chat"]["id"]
                 data = cq.get("data", "")
                 tg_call("answerCallbackQuery", {"callback_query_id": cq["id"]})
-                if data.startswith("pkg_"):
+
+                if data == "trial":
+                    handle_trial(uid)
+                elif data.startswith("pkg_"):
                     pkg_key = data[4:]
                     if pkg_key in PACKAGES:
                         send_payment_instructions(uid, pkg_key)
@@ -135,23 +169,19 @@ def main():
             elif len(text) == 64:
                 pkg_key = pending_package.get(uid)
                 if not pkg_key:
-                    tg_call("sendMessage", {
-                        "chat_id": uid,
-                        "text": "Please choose a plan first by sending /start"
-                    })
+                    tg_call("sendMessage", {"chat_id": uid, "text": "Please choose a plan first by sending /start"})
                     continue
 
                 if text in USED_TXS:
                     tg_call("sendMessage", {"chat_id": uid, "text": "\u274c This TXID has already been used."})
                 else:
                     tg_call("sendMessage", {"chat_id": uid, "text": "\U0001f50d Checking transaction on blockchain..."})
-                    required = PACKAGES[pkg_key]["price"]
-                    if check_tron_scan(text, required):
+                    if check_tron_scan(text, PACKAGES[pkg_key]["price"]):
                         link_res = tg_call("createChatInviteLink", {"chat_id": CHANNEL_ID, "member_limit": 1})
                         invite_link = link_res.get("result", {}).get("invite_link") if link_res else None
                         if invite_link:
-                            save_used_tx(text)
                             USED_TXS.add(text)
+                            save_json_set(USED_TXS_FILE, USED_TXS)
                             pending_package.pop(uid, None)
                             tg_call("sendMessage", {
                                 "chat_id": uid,
