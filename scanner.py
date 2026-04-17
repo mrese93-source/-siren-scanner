@@ -57,7 +57,7 @@ MIN_TURNOVER_24H_EXPLOSIVE = 150_000
 
 ORDERBOOK_TTL_SEC = 25
 MAX_SPREAD_NORMAL_PCT = 0.45
-MAX_SPREAD_EXPLOSIVE_PCT = 0.80
+MAX_SPREAD_EXPLOSIVE_PCT = 2.0
 DEPTH_BAND_NORMAL_PCT = 0.50
 DEPTH_BAND_EXPLOSIVE_PCT = 0.80
 MIN_DEPTH_NORMAL_USDT = 20_000
@@ -1044,9 +1044,11 @@ def check_signals(symbol, price):
             spread_pct = obc.get("spread_pct", 0.0)
             payload = obc["payload"]
 
-            max_spread = MAX_SPREAD_EXPLOSIVE_PCT if is_explosive else MAX_SPREAD_NORMAL_PCT
-            band = DEPTH_BAND_EXPLOSIVE_PCT if is_explosive else DEPTH_BAND_NORMAL_PCT
-            min_depth = MIN_DEPTH_EXPLOSIVE_USDT if is_explosive else MIN_DEPTH_NORMAL_USDT
+            strong_move = abs(change_1m) >= 3.0
+            use_loose   = is_explosive or strong_move
+            max_spread  = MAX_SPREAD_EXPLOSIVE_PCT if use_loose else MAX_SPREAD_NORMAL_PCT
+            band        = DEPTH_BAND_EXPLOSIVE_PCT if use_loose else DEPTH_BAND_NORMAL_PCT
+            min_depth   = MIN_DEPTH_EXPLOSIVE_USDT if use_loose else MIN_DEPTH_NORMAL_USDT
 
             if spread_pct > max_spread:
                 return
