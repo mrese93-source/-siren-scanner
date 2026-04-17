@@ -83,16 +83,17 @@ LIQ_WINDOW_SEC            = 60
 LIQ_MIN_USDT              = 100_000
 LIQ_ALERT_COOLDOWN_SEC    = 5 * 60
 
-# Structural liquidity zones (Weekly/Daily swing points + orderbook confirmation)
-ZONE_APPROACH_PCT         = 0.5          # alert when price within 0.5% of zone
+# Structural liquidity zones (wick + volume based, Weekly/Daily)
+ZONE_APPROACH_PCT         = 0.3          # alert when price within 0.3% of zone
 ZONE_COOLDOWN_SEC         = 4 * 60 * 60  # 4 hours between zone alerts per symbol
-ZONE_MIN_OI               = 1_000_000   # min $1M OI to check zones
-ZONE_CLUSTER_PCT          = 0.8         # merge swing levels within 0.8%
-ZONE_SWING_NEIGHBORS      = 2           # candles on each side to confirm swing
-ZONE_OB_DEPTH_MIN_USDT    = 300_000     # min $300K orderbook depth at the level
+ZONE_MIN_OI               = 5_000_000   # min $5M OI to check zones
+ZONE_CLUSTER_PCT          = 0.8         # merge levels within 0.8%
+ZONE_MIN_WICK_RATIO       = 0.4         # wick must be >= 40% of candle range
+ZONE_MIN_VOL_MULTIPLIER   = 1.5         # volume must be 1.5x the timeframe average
+ZONE_OB_DEPTH_MIN_USDT    = 500_000     # min $500K orderbook depth at the level
 ZONE_OB_BAND_PCT          = 0.5         # check depth within 0.5% of zone price
-ZONE_WEEKLY_WEIGHT        = 3           # weekly swing points get 3x weight
-ZONE_DAILY_WEIGHT         = 1           # daily swing points get 1x weight
+ZONE_WEEKLY_WEIGHT        = 3           # weekly candles get 3x weight
+ZONE_DAILY_WEIGHT         = 1           # daily candles get 1x weight
 ZONE_LEVELS_CACHE_TTL     = 12 * 60 * 60  # refresh zones every 12 hours
 
 # Compression (big move incoming)
@@ -555,35 +556,54 @@ def process_liquidation(symbol, side, size_usdt, price):
         liq_events[symbol].clear()
 
 
-def detect_swing_points(candles, neighbors=2):
+def detect_wick_zones(candles):
     """
-    candles: list of [startTime, open, high, low, close, ...] newest-first (Bybit default).
-    Returns list of (price, 'high'|'low').
-    A swing high is confirmed when its high is strictly greater than all N neighbors on each side.
-    A swing low is confirmed when its low is strictly less than all N neighbors on each side.
+    candles: list of [startTime, open, high, low, close, volume, turnover] newest-first.
+    Returns list of (price, 'high'|'low') where there's a big wick + above-average volume.
+    Big wick = wick is >= ZONE_MIN_WICK_RATIO of total candle range.
+    High volume = candle volume >= ZONE_MIN_VOL_MULTIPLIER * average volume.
     """
+    if not candles:
+        return []
     candles = list(reversed(candles))  # chronological order
-    n = len(candles)
+
+    volumes = [safe_float(c[5]) for c in candles if len(c) > 5 and safe_float(c[5]) > 0]
+    avg_vol = sum(volumes) / len(volumes) if volumes else 0
+
     result = []
-    for i in range(neighbors, n - neighbors):
-        high_i = safe_float(candles[i][2])
-        low_i  = safe_float(candles[i][3])
-        if high_i > 0 and all(
-            high_i > safe_float(candles[i - k][2]) and high_i > safe_float(candles[i + k][2])
-            for k in range(1, neighbors + 1)
-        ):
-            result.append((high_i, "high"))
-        if low_i > 0 and all(
-            low_i < safe_float(candles[i - k][3]) and low_i < safe_float(candles[i + k][3])
-            for k in range(1, neighbors + 1)
-        ):
-            result.append((low_i, "low"))
+    for c in candles:
+        if len(c) < 6:
+            continue
+        open_  = safe_float(c[1])
+        high   = safe_float(c[2])
+        low    = safe_float(c[3])
+        close  = safe_float(c[4])
+        vol    = safe_float(c[5])
+
+        candle_range = high - low
+        if candle_range <= 0 or high <= 0:
+            continue
+
+        if avg_vol > 0 and vol < avg_vol * ZONE_MIN_VOL_MULTIPLIER:
+            continue
+
+        body_high = max(open_, close)
+        body_low  = min(open_, close)
+
+        upper_wick = high - body_high
+        if upper_wick / candle_range >= ZONE_MIN_WICK_RATIO:
+            result.append((high, "high"))
+
+        lower_wick = body_low - low
+        if lower_wick / candle_range >= ZONE_MIN_WICK_RATIO:
+            result.append((low, "low"))
+
     return result
 
 
-def fetch_swing_zones(symbol):
+def fetch_wick_zones(symbol):
     """
-    Fetch Weekly (52 candles) + Daily (90 candles) swing points.
+    Fetch Weekly (52 candles) + Daily (90 candles) wick-based liquidity zones.
     Returns list of (price, weight, 'high'|'low').
     """
     raw = []
@@ -593,9 +613,8 @@ def fetch_swing_zones(symbol):
     )
     if weekly:
         candles = weekly.get("result", {}).get("list", []) or []
-        if len(candles) >= ZONE_SWING_NEIGHBORS * 2 + 1:
-            for price, ptype in detect_swing_points(candles, ZONE_SWING_NEIGHBORS):
-                raw.append((price, ZONE_WEEKLY_WEIGHT, ptype))
+        for price, ptype in detect_wick_zones(candles):
+            raw.append((price, ZONE_WEEKLY_WEIGHT, ptype))
 
     daily = http_get_json(
         f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=D&limit=90",
@@ -603,9 +622,8 @@ def fetch_swing_zones(symbol):
     )
     if daily:
         candles = daily.get("result", {}).get("list", []) or []
-        if len(candles) >= ZONE_SWING_NEIGHBORS * 2 + 1:
-            for price, ptype in detect_swing_points(candles, ZONE_SWING_NEIGHBORS):
-                raw.append((price, ZONE_DAILY_WEIGHT, ptype))
+        for price, ptype in detect_wick_zones(candles):
+            raw.append((price, ZONE_DAILY_WEIGHT, ptype))
 
     return raw
 
@@ -646,7 +664,7 @@ def get_cached_zones(symbol):
     cache = historical_levels_cache.get(symbol)
     if cache and ts - cache[0] < ZONE_LEVELS_CACHE_TTL:
         return cache[1]
-    raw   = fetch_swing_zones(symbol)
+    raw   = fetch_wick_zones(symbol)
     zones = cluster_swing_zones(raw)
     historical_levels_cache[symbol] = (ts, zones)
     print(f"ZONES cached: {symbol} → {len(zones)} structural zones", flush=True)
