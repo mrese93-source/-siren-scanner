@@ -86,7 +86,7 @@ LIQ_ALERT_COOLDOWN_SEC    = 5 * 60
 # Structural liquidity zones (Weekly/Daily swing points + orderbook confirmation)
 ZONE_APPROACH_PCT         = 0.5          # alert when price within 0.5% of zone
 ZONE_COOLDOWN_SEC         = 4 * 60 * 60  # 4 hours between zone alerts per symbol
-ZONE_MIN_OI               = 5_000_000   # min $5M OI to check zones
+ZONE_MIN_OI               = 1_000_000   # min $1M OI to check zones
 ZONE_CLUSTER_PCT          = 0.8         # merge swing levels within 0.8%
 ZONE_SWING_NEIGHBORS      = 2           # candles on each side to confirm swing
 ZONE_OB_DEPTH_MIN_USDT    = 300_000     # min $300K orderbook depth at the level
