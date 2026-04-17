@@ -2,23 +2,25 @@ import requests
 import time
 import os
 import json
+import threading
 
 TOKEN      = os.environ.get("SNIPER_TOKEN", "8640215686:AAHvQDoFMxX8KyKLuGTcAJ5D4xf0DBWFnDA")
 MY_WALLET  = os.environ.get("MY_WALLET", "TXj3JCr6ZbM8Tnq8WqLubL81g4mwAw5pUr")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003976387571"))
 
 PACKAGES = {
-    "weekly":  {"name": "Weekly",   "price": 15, "label": "\U0001f4c5 Weekly \u2014 $15"},
-    "monthly": {"name": "Monthly",  "price": 30, "label": "\U0001f4c6 Monthly \u2014 $30"},
-    "3months": {"name": "3 Months", "price": 80, "label": "\U0001f5d3 3 Months \u2014 $80"},
+    "weekly":  {"name": "Weekly",   "price": 15, "days": 7,  "label": "\U0001f4c5 Weekly \u2014 $15"},
+    "monthly": {"name": "Monthly",  "price": 30, "days": 30, "label": "\U0001f4c6 Monthly \u2014 $30"},
+    "3months": {"name": "3 Months", "price": 80, "days": 90, "label": "\U0001f5d3 3 Months \u2014 $80"},
 }
 
-USED_TXS_FILE    = "used_txs.json"
-USED_TRIAL_FILE  = "used_trials.json"
+USED_TXS_FILE      = "used_txs.json"
+USED_TRIAL_FILE    = "used_trials.json"
+SUBSCRIBERS_FILE   = "subscribers.json"
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-pending_package  = {}
-pending_trial    = set()
+pending_package = {}
+pending_trial   = set()
 
 
 def load_json_set(filepath):
@@ -34,6 +36,21 @@ def load_json_set(filepath):
 def save_json_set(filepath, data_set):
     with open(filepath, "w") as f:
         json.dump(list(data_set), f)
+
+
+def load_subscribers():
+    if os.path.exists(SUBSCRIBERS_FILE):
+        try:
+            with open(SUBSCRIBERS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_subscribers(subs):
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        json.dump(subs, f)
 
 
 USED_TXS   = load_json_set(USED_TXS_FILE)
@@ -60,6 +77,40 @@ def tg_call(method, data):
         return requests.post(URL + method, json=data, timeout=15).json()
     except Exception:
         return None
+
+
+def add_subscriber(user_id, days):
+    subs = load_subscribers()
+    expire_ts = int(time.time()) + days * 86400
+    subs[str(user_id)] = expire_ts
+    save_subscribers(subs)
+
+
+def kick_expired_subscribers():
+    while True:
+        try:
+            subs = load_subscribers()
+            now = int(time.time())
+            changed = False
+            for user_id, expire_ts in list(subs.items()):
+                if now >= expire_ts:
+                    tg_call("banChatMember", {"chat_id": CHANNEL_ID, "user_id": int(user_id)})
+                    tg_call("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": int(user_id)})
+                    tg_call("sendMessage", {
+                        "chat_id": int(user_id),
+                        "text": (
+                            "\u23f0 Your subscription has expired.\n\n"
+                            "Renew anytime by sending /start"
+                        )
+                    })
+                    del subs[user_id]
+                    changed = True
+                    print(f"Kicked expired user: {user_id}", flush=True)
+            if changed:
+                save_subscribers(subs)
+        except Exception as e:
+            print(f"Kick loop error: {e}", flush=True)
+        time.sleep(3600)
 
 
 def send_package_menu(uid):
@@ -140,6 +191,7 @@ def give_trial(uid, phone):
     if invite_link:
         USED_TRIAL.add(phone)
         save_json_set(USED_TRIAL_FILE, USED_TRIAL)
+        add_subscriber(uid, 1)
         tg_call("sendMessage", {
             "chat_id": uid,
             "text": (
@@ -160,6 +212,8 @@ def give_trial(uid, phone):
 
 def main():
     print("Bot is Live...", flush=True)
+    threading.Thread(target=kick_expired_subscribers, daemon=True).start()
+
     offset = 0
     while True:
         updates = tg_call("getUpdates", {"offset": offset, "timeout": 20})
@@ -189,7 +243,6 @@ def main():
             msg  = update["message"]
             uid  = msg["chat"]["id"]
 
-            # Handle phone number sharing
             if "contact" in msg and uid in pending_trial:
                 phone = msg["contact"].get("phone_number", "")
                 pending_trial.discard(uid)
@@ -217,6 +270,7 @@ def main():
                         if invite_link:
                             USED_TXS.add(text)
                             save_json_set(USED_TXS_FILE, USED_TXS)
+                            add_subscriber(uid, PACKAGES[pkg_key]["days"])
                             pending_package.pop(uid, None)
                             tg_call("sendMessage", {
                                 "chat_id": uid,
