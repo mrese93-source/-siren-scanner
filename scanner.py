@@ -964,11 +964,7 @@ def check_signals(symbol, price):
     ts = now_ts()
 
     with lock:
-        last_fast = last_fast_alert.get(symbol)
         last_slow = last_slow_alert.get(symbol)
-
-    fast_blocked = (last_fast is not None) and (ts - last_fast < FAST_ANTI_SPAM_SEC)
-    slow_blocked = (last_slow is not None) and (ts - last_slow < SLOW_ANTI_SPAM_SEC)
 
     with lock:
         prices_list = list(price_history[symbol])
@@ -1064,16 +1060,20 @@ def check_signals(symbol, price):
             if t1m < MIN_1M_TURNOVER_USDT:
                 return
 
-    if score >= 4 and not fast_blocked:
-        is_long = change_1m > 0 and change_3m > 0
+    if score >= 4:
+        is_long  = change_1m > 0 and change_3m > 0
         is_short = change_1m < 0 and change_3m < 0
+        direction = "long" if is_long else ("short" if is_short else None)
 
-        if is_long or is_short:
-            check_whale_trades(symbol, price)
-            send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score)
+        if direction:
             with lock:
-                last_fast_alert[symbol] = ts
-            return
+                last_dir = last_fast_alert.get((symbol, direction), 0)
+            if ts - last_dir >= FAST_ANTI_SPAM_SEC:
+                check_whale_trades(symbol, price)
+                send_fast_alert(symbol, price, change_1m, change_3m, change_5m, signals, score)
+                with lock:
+                    last_fast_alert[(symbol, direction)] = ts
+                return
 
     slow_trigger = (
         abs(change_15m) >= MOVE_15M
