@@ -802,7 +802,6 @@ def on_message(ws, message):
         ticker_data = data.get("data") or {}
         symbol = ticker_data.get("symbol") or ""
         last_price = safe_float(ticker_data.get("lastPrice", 0))
-        print(symbol, last_price, flush=True)
 
         if not symbol or last_price <= 0:
             return
@@ -880,4 +879,3 @@ if __name__ == "__main__":
             print(f"WebSocket crashed: {e}", flush=True)
             print("Reconnecting in 10s...", flush=True)
             time.sleep(10)
-
