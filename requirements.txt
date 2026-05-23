@@ -1,2 +1,5 @@
 requests
 websocket-client
+
+# Bybit trading bot
+pybit>=5.7.0
